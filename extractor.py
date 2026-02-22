@@ -60,11 +60,10 @@ class TextExtractor:
         stitched = self.apply_decimal_stitcher(valid_pre)
         gdt_stitched = self.apply_gdt_stitcher(stitched)
         dim_tol_stitched = self.apply_dimension_tolerance_stitcher(gdt_stitched)
-        reconstructed = self.apply_numeric_reconstruction(dim_tol_stitched)
 
         # Final cleanup: drop isolated non-XYZ single letters
         result = []
-        for item in reconstructed:
+        for item in dim_tol_stitched:
             clean_t = item['text'].replace(".", "").strip()
             if len(clean_t) == 1 and clean_t.isalpha():
                 if clean_t.upper() not in ['X', 'Y', 'Z']:
@@ -312,102 +311,8 @@ class TextExtractor:
 
         return merged
 
-    def apply_numeric_reconstruction(self, items):
-        """
-        Post-OCR Numeric Reconstruction:
-        Merges fragmented numeric tokens horizontally based on engineering rules.
-        Handles patterns like:
-        - Box(NUMBER) + Box(.) + Box(NUMBER)
-        - Box(NUMBER) + Box(NUMBER where len 1-2)
-        """
-        # Sort left-to-right
-        sorted_items = sorted(items, key=lambda i: min(p[0] for p in i['bbox']))
-        merged = []
-        skip = set()
-
-        for i, item in enumerate(sorted_items):
-            if i in skip:
-                continue
-
-            # Start of a potential chain
-            t1 = item['text'].strip()
-            bbox1 = item['bbox']
-            x1_max = max(p[0] for p in bbox1)
-            y1_cy = sum(p[1] for p in bbox1) / 4
-
-            # If it's a number (ends with digit) or a lone dot
-            if not (t1.strip('.').isdigit() or t1 == '.' or re.search(r'\d$', t1)):
-                merged.append(item)
-                continue
-
-            current_t = t1
-            current_bbox = bbox1
-            current_conf = item['confidence']
-            chain_count = 1
-
-            # Look ahead for adjacent fragments
-            for j in range(i + 1, len(sorted_items)):
-                if j in skip:
-                    continue
-                other = sorted_items[j]
-                t2 = other['text'].strip()
-                bbox2 = other['bbox']
-                x2_min = min(p[0] for p in bbox2)
-                y2_cy = sum(p[1] for p in bbox2) / 4
-
-                # Must be on the same line and very close horizontally (fragment gap)
-                gap = x2_min - x1_max
-                if abs(y1_cy - y2_cy) > 15:
-                    continue  # not same line
-                if not (-10 <= gap <= 60):
-                    break  # too far right (or overlapping wrong)
-
-                # Rule 1: "." followed by number
-                if current_t.isdigit() and t2 == '.':
-                    current_t += "."
-                    chain_count += 1
-                elif current_t.endswith('.') and t2.isdigit():
-                    current_t += t2
-                    chain_count += 1
-                # Rule 2: Number followed by 1-2 digits
-                elif re.search(r'\d$', current_t) and t2.isdigit() and len(t2) <= 2:
-                    current_t += "." + t2 if "." not in current_t and "." not in t2 else t2
-                    chain_count += 1
-                # Rule 3: Number followed by " . X"
-                elif re.search(r'\d$', current_t) and re.match(r'^\.\s*\d+$', t2):
-                    current_t += t2.replace(" ", "")
-                    chain_count += 1
-                else:
-                    break # no merge rule matched
-
-                # Update running box and skip the merged item
-                skip.add(j)
-                x1_max = max(p[0] for p in bbox2)
-                cx_min = min(p[0] for p in current_bbox + bbox2)
-                cx_max = max(p[0] for p in current_bbox + bbox2)
-                cy_min = min(p[1] for p in current_bbox + bbox2)
-                cy_max = max(p[1] for p in current_bbox + bbox2)
-                current_bbox = [[cx_min, cy_min], [cx_max, cy_min], [cx_max, cy_max], [cx_min, cy_max]]
-                current_conf = (current_conf * chain_count + other['confidence']) / (chain_count + 1)
-
-            merged.append({
-                'bbox': current_bbox,
-                'text': current_t,
-                'confidence': current_conf
-            })
-
-        return merged
-
     def clean_text_content(self, text):
         """Applies regex replacements to fix common OCR errors."""
-        # Clean internal spacing in numbers/decimals (± 0 . 02 -> ±0.02)
-        text = re.sub(r'([±\+\-])\s+(\d)', r'\1\2', text)
-        text = re.sub(r'([⌀Øø])\s+(\d)', r'\1\2', text)
-        text = re.sub(r'(\d)\s+\.\s+(\d)', r'\1.\2', text)
-        text = re.sub(r'(\d)\s+(\.)', r'\1\2', text)
-        text = re.sub(r'(\.)\s+(\d)', r'\1\2', text)
-        
-        # Existing rules
         text = re.sub(r'(\d+)\s*\.\s*(\d+)', r'\1.\2', text)
         text = text.replace('YIz', 'Y')
         text = text.replace('S00', '0.05')
