@@ -57,6 +57,9 @@ class TextExtractor:
         v_merged = self.merge_vertical_items(h_merged)
         valid_pre = self.cleanup_items(v_merged)
 
+        for item in valid_pre:
+            item["type"] = self.classify_token(item["text"])
+
         stitched = self.apply_decimal_stitcher(valid_pre)
         gdt_stitched = self.apply_gdt_stitcher(stitched)
         dim_tol_stitched = self.apply_dimension_tolerance_stitcher(gdt_stitched)
@@ -68,16 +71,67 @@ class TextExtractor:
             if len(clean_t) == 1 and clean_t.isalpha():
                 if clean_t.upper() not in ['X', 'Y', 'Z']:
                     continue
-            item['text'] = self.clean_text_content(item['text'])
+            fixed = self.clean_text_content(item['text'])
+            fixed = self.repair_numeric_strings(fixed)
+            item['text'] = fixed
             result.append(item)
 
         return result
 
+    def repair_numeric_strings(self, text):
+        """
+        Repairs numbers already merged inside a single OCR token.
+        """
+        t = text.strip()
+
+        # Pattern: 263 92 → 263.92
+        if re.match(r'^\d{2,4}\s+\d{1,2}$', t):
+            parts = t.split()
+            return parts[0] + "." + parts[1]
+
+        # Pattern: 255 6 4 → 255.64
+        if re.match(r'^\d{2,4}\s+\d\s+\d$', t):
+            parts = t.split()
+            return parts[0] + "." + parts[1] + parts[2]
+
+        # Pattern: 0 7 6 → 0.76
+        if re.match(r'^\d\s+\d\s+\d$', t):
+            parts = t.split()
+            return parts[0] + "." + parts[1] + parts[2]
+
+        # Pattern: 34 . 72 → 34.72
+        if re.match(r'^\d+\s*\.\s*\d+$', t):
+            return re.sub(r'\s*\.\s*', '.', t)
+
+        # Pattern: 68 , 72 → 68.72
+        if re.match(r'^\d+\s*,\s*\d+$', t):
+            return re.sub(r'\s*,\s*', '.', t)
+
+        return text
+
+
+    def classify_token(self, text):
+        text = text.strip()
+        if re.match(r'^\d+$', text):
+            return "INTEGER"
+        if re.match(r'^\.\d+$', text):
+            return "DECIMAL_FRAGMENT"
+        if re.match(r'^\d+\.$', text):
+            return "DECIMAL_PREFIX"
+        if re.match(r'^\d+\.\d+$', text):
+            return "FULL_DECIMAL"
+        if re.match(r'^[±\+\-]?\d+(\.\d+)?$', text):
+            return "TOLERANCE"
+        if re.match(r'^[A-Z]$', text):
+            return "DATUM"
+        if 'Ø' in text or 'ø' in text:
+            return "DIAMETER"
+        return "TEXT"
+
     def apply_decimal_stitcher(self, items):
         """
-        Merges short digit tokens (1-3 chars) with the next right-adjacent
-        numeric or datum-letter token within 150px and 20px vertical tolerance.
-        Handles cases like '3' + '.58' -> '3.58', or '0.2' + 'D' -> '0.2 D'.
+        Merges strictly classified integer and decimal fragments based on semantics.
+        Handles cases like '3' (INTEGER) + '.58' (DECIMAL_FRAGMENT) -> '3.58'
         """
         stitched_items = []
         skip_idx = set()
@@ -88,8 +142,7 @@ class TextExtractor:
             if i in skip_idx:
                 continue
 
-            t1 = item['text'].strip()
-            if len(t1) <= 3 and sum(c.isdigit() for c in t1) > 0:
+            if item.get("type") == "INTEGER":
                 bbox1 = item['bbox']
                 x1_max = max(p[0] for p in bbox1)
                 y1_cy = sum(p[1] for p in bbox1) / 4
@@ -99,22 +152,18 @@ class TextExtractor:
                     if j in skip_idx:
                         continue
                     item2 = items_sorted[j]
-                    t2 = item2['text'].strip()
                     bbox2 = item2['bbox']
                     x2_min = min(p[0] for p in bbox2)
                     y2_cy = sum(p[1] for p in bbox2) / 4
 
-                    # 20px vertical tolerance — tight enough to not span table rows (35-40px apart)
-                    if abs(y1_cy - y2_cy) < 20 and 0 < (x2_min - x1_max) < 150:
-                        is_num = sum(c.isdigit() for c in t2) > 0
-                        is_datum_letter = (len(t2) == 1 and t2.isalpha())
-                        if is_num or is_datum_letter:
+                    # 20px vertical tolerance
+                    if abs(y1_cy - y2_cy) < 20 and 0 <= (x2_min - x1_max) < 150:
+                        if item2.get("type") in ["DECIMAL_FRAGMENT", "DECIMAL_PREFIX"]:
                             best_j = j
                             break
 
                 if best_j != -1:
                     item2 = items_sorted[best_j]
-                    t2 = item2['text'].strip()
                     bbox2 = item2['bbox']
 
                     new_x_min = min(p[0] for p in bbox1 + bbox2)
@@ -124,16 +173,14 @@ class TextExtractor:
                     new_bbox = [[new_x_min, new_y_min], [new_x_max, new_y_min],
                                 [new_x_max, new_y_max], [new_x_min, new_y_max]]
 
-                    if "." not in t1 and "." not in t2 and t1.isdigit() and len(t1) <= 2:
-                        new_t = t1 + "." + t2
-                    else:
-                        new_t = t1 + " " + t2
-                        new_t = new_t.replace(" .", ".")
-
-                    stitched_items.append({
+                    new_t = item['text'].strip() + item2['text'].strip()
+                    
+                    new_item = {
                         'bbox': new_bbox, 'text': new_t,
-                        'confidence': (item['confidence'] + item2['confidence']) / 2
-                    })
+                        'confidence': (item['confidence'] + item2['confidence']) / 2,
+                        'type': self.classify_token(new_t)
+                    }
+                    stitched_items.append(new_item)
                     skip_idx.add(best_j)
                     continue
 
@@ -407,6 +454,20 @@ class TextExtractor:
                 if best_match_idx != -1:
                     j = best_match_idx
                     next_item = merged_items[j]
+                    
+                    # === BLOCK ALL NUMERIC MERGING ===
+                    curr_text_clean = curr_item['text'].strip()
+                    next_text_clean = next_item['text'].strip()
+
+                    def is_numeric_like(t):
+                        return bool(re.match(r'^[\d\.\+\-]+$', t))
+
+                    # If both tokens are numeric-like, DO NOT merge here.
+                    # Leave them separate for semantic stitchers later.
+                    if is_numeric_like(curr_text_clean) and is_numeric_like(next_text_clean):
+                        new_merged.append(curr_item)
+                        continue
+
                     next_bbox = next_item['bbox']
                     new_x_min = min([p[0] for p in curr_bbox] + [p[0] for p in next_bbox])
                     new_x_max = max([p[0] for p in curr_bbox] + [p[0] for p in next_bbox])
