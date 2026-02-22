@@ -14,15 +14,6 @@ class Visualizer:
         annotated_image = image.copy()
         mappings = []
         
-        # Draw a blue bounding box around the entire cluster to show grouping
-        if text_items:
-            all_x = [p[0] for item in text_items for p in item['bbox']]
-            all_y = [p[1] for item in text_items for p in item['bbox']]
-            if all_x and all_y:
-                cx_min, cx_max = int(min(all_x)), int(max(all_x))
-                cy_min, cy_max = int(min(all_y)), int(max(all_y))
-                # Image is RGB from PyMuPDF, so Blue is (0, 0, 255)
-                cv2.rectangle(annotated_image, (cx_min, cy_min), (cx_max, cy_max), (0, 0, 255), 2)
         
         # Helper to get numeric sort key if needed, but we'll specific sequential ID
         # For now, just iterate and assign 1, 2, 3...
