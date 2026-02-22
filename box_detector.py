@@ -134,15 +134,35 @@ class BoxCharacterDetector:
             return []
 
         # Skip rects already covered by existing items (centre inside existing bbox)
+        # Skip rects already covered by existing items (check for significant area overlap)
         def overlaps_existing(rx, ry, rw, rh):
-            rcx, rcy = rx + rw / 2, ry + rh / 2
-            for it in existing_items:
+            box_area = rw * rh
+            if box_area == 0:
+                return False
+                
+            for it in existing_items + exclusion_items:
                 ix_min = min(p[0] for p in it['bbox'])
                 iy_min = min(p[1] for p in it['bbox'])
                 ix_max = max(p[0] for p in it['bbox'])
                 iy_max = max(p[1] for p in it['bbox'])
-                if ix_min <= rcx <= ix_max and iy_min <= rcy <= iy_max:
+                
+                # Intersection
+                ox = max(0, min(rx + rw, ix_max) - max(rx, ix_min))
+                oy = max(0, min(ry + rh, iy_max) - max(ry, iy_min))
+                overlap_area = ox * oy
+                
+                item_area = (ix_max - ix_min) * (iy_max - iy_min)
+                
+                # If overlap is > 40% of either box, it's the same item
+                if item_area > 0 and overlap_area / min(box_area, item_area) > 0.4:
                     return True
+                    
+                # Also check if centers are very close
+                rcx, rcy = rx + rw / 2, ry + rh / 2
+                icx, icy = (ix_min + ix_max) / 2, (iy_min + iy_max) / 2
+                if abs(rcx - icx) < 40 and abs(rcy - icy) < 40:
+                    return True
+                    
             return False
 
         # Patterns that are valid annotation content from a bordered box
@@ -150,7 +170,7 @@ class BoxCharacterDetector:
         datum_ref     = re.compile(r'^[\d.,\s+⊕⌀Øø\|ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg]{1,20}$')
         
         new_items = []
-        seen_centers = []  # dedup within this pass
+        seen_boxes = []  # store (rx, ry, rw, rh) for within-pass dedup
         for (rx, ry, rw, rh) in candidate_rects:
             # Skip if it overlaps an existing item
             if overlaps_existing(rx, ry, rw, rh):
@@ -162,8 +182,18 @@ class BoxCharacterDetector:
             if rcx > w * 0.72 and rcy > h * 0.75:
                 continue
 
-            # Dedup within this pass
-            if any(abs(rcx - sc[0]) < 50 and abs(rcy - sc[1]) < 50 for sc in seen_centers):
+            # Dedup within this pass using IoU / area overlap
+            is_seen = False
+            box_area = rw * rh
+            for (sx, sy, sw, sh) in seen_boxes:
+                ox = max(0, min(rx + rw, sx + sw) - max(rx, sx))
+                oy = max(0, min(ry + rh, sy + sh) - max(ry, sy))
+                overlap = ox * oy
+                seen_area = sw * sh
+                if overlap > 0 and overlap / min(box_area, seen_area) > 0.5:
+                    is_seen = True
+                    break
+            if is_seen:
                 continue
 
             # OCR the individual box
@@ -179,7 +209,7 @@ class BoxCharacterDetector:
                     continue
                 bbox = [[rx, ry], [rx + rw, ry], [rx + rw, ry + rh], [rx, ry + rh]]
                 new_items.append({'bbox': bbox, 'text': clean, 'confidence': conf, 'source': 'gdt_frame_detector'})
-                seen_centers.append((rcx, rcy))
+                seen_boxes.append((rx, ry, rw, rh))
                 print(f"  - GD&T frame detected: '{clean}' @ ({rx},{ry})")
 
         return new_items
