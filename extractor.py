@@ -32,6 +32,7 @@ class TextExtractor:
         """
         Extracts text from an image (numpy array).
         Returns a list of dicts: {'bbox', 'text', 'confidence'}
+        PaddleOCR-native: skips merge logic since Paddle already returns grouped blocks.
         """
         if not isinstance(image, np.ndarray):
             raise ValueError("Image must be a numpy array")
@@ -43,26 +44,30 @@ class TextExtractor:
             for line in results[0]:
                 bbox, (text, prob) = line
                 if prob > 0.2:
+                    # 1. Normalize whitespace (Paddle can return " 34   .   72 ")
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    # 2. Clean OCR errors
+                    text = self.clean_text_content(text)
+                    # 3. Repair numeric strings ("34 . 72" → "34.72")
+                    text = self.repair_numeric_strings(text)
                     text_items.append({
                         'bbox': bbox,
                         'text': text,
                         'confidence': prob
                     })
         
-        horizontal_merged = self.merge_horizontal_items(text_items)
-        final_merged = self.merge_vertical_items(horizontal_merged)
-        final_clean = self.cleanup_items(final_merged)
-        
-        for item in final_clean:
-            item['text'] = self.clean_text_content(item['text'])
-            
-        return final_clean
+        return self.cleanup_items(text_items)
 
     def extract_text_custom(self, image, x_threshold=40):
         """
-        Custom extraction used by main pipeline with lower x_threshold (40px)
-        to prevent GD&T merging with adjacent dimensions.
-        Returns cleaned, stitched items ready for filtering.
+        Main pipeline entry point used by main.py.
+        PaddleOCR-native: skips all fragment-merge/stitch logic since Paddle
+        already returns grouped text blocks. Pipeline:
+          raw OCR → normalize spaces → clean → repair numerics → filter noise → classify.
+
+        NOTE: merge_horizontal_items, merge_vertical_items, apply_decimal_stitcher,
+        apply_gdt_stitcher, apply_dimension_tolerance_stitcher are kept as dormant
+        fallbacks below but are NOT called here.
         """
         if not isinstance(image, np.ndarray):
             raise ValueError("Image must be a numpy array")
@@ -73,29 +78,28 @@ class TextExtractor:
             for line in raw_results[0]:
                 bbox, (text, prob) = line
                 if prob > 0.2:
+                    # Step 1: normalize whitespace
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    # Step 2: clean OCR character errors
+                    text = self.clean_text_content(text)
+                    # Step 3: repair split decimals within a single token
+                    text = self.repair_numeric_strings(text)
                     raw_items.append({'bbox': bbox, 'text': text, 'confidence': prob})
 
-        h_merged = self.merge_horizontal_items(raw_items, x_threshold=x_threshold)
-        v_merged = self.merge_vertical_items(h_merged)
-        valid_pre = self.cleanup_items(v_merged)
+        # Step 4: remove noise/garbage tokens
+        valid_items = self.cleanup_items(raw_items)
 
-        for item in valid_pre:
+        # Step 5: classify each token type for downstream logic
+        for item in valid_items:
             item["type"] = self.classify_token(item["text"])
 
-        stitched = self.apply_decimal_stitcher(valid_pre)
-        gdt_stitched = self.apply_gdt_stitcher(stitched)
-        dim_tol_stitched = self.apply_dimension_tolerance_stitcher(gdt_stitched)
-
-        # Final cleanup: drop isolated non-XYZ single letters
+        # Step 6: final single-letter drop (non-datum letters)
         result = []
-        for item in dim_tol_stitched:
-            clean_t = item['text'].replace(".", "").strip()
+        for item in valid_items:
+            clean_t = item['text'].replace('.', '').strip()
             if len(clean_t) == 1 and clean_t.isalpha():
                 if clean_t.upper() not in ['X', 'Y', 'Z']:
                     continue
-            fixed = self.clean_text_content(item['text'])
-            fixed = self.repair_numeric_strings(fixed)
-            item['text'] = fixed
             result.append(item)
 
         return result

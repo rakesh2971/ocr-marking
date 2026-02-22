@@ -262,9 +262,8 @@ def main():
                     [cx_g - hw_g, cy_g + hh_g]
                 ]
 
-        # ── 4.9. Merge dimension + tolerance into one item (one box per dimension) ──
-        valid_items = extractor.apply_dimension_tolerance_stitcher(valid_items)
-        print(f"After dimension+tolerance merge: {len(valid_items)} items.")
+        # ── 4.9. (PaddleOCR-native: dimension+tolerance stitcher removed) ──────
+        # PaddleOCR already returns grouped blocks; stitching is no longer needed.
 
         # ── 5. Group by drawing views + sort in reading order ─────────────────
         print("Grouping annotations by drawing views...")
