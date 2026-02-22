@@ -94,19 +94,24 @@ class BoxCharacterDetector:
 
     def detect_gdt_frames(self, image, existing_items=[], exclusion_items=[]):
         """
-        Detects GD&T feature control frames (multi-compartment horizontal groups of boxes)
-        that are NOT isolated (so they're filtered out by detect_boxed_characters).
-        Groups adjacent boxes in the same row and OCRs the entire group as one item.
-        Also catches datum boxes (single boxed letter) that might have been missed.
+        Detects bordered dimension/datum boxes that EasyOCR misses because they
+        are surrounded by a rectangle.
+        
+        Instead of grouping adjacent boxes (which causes over-merging), this method
+        detects each bordered box individually, OCRs it, and accepts the result if it
+        looks like a decimal dimension (e.g. 4.88, 0.5) or a short datum reference
+        (e.g. F, A B C, 0.5 A B).
         """
+        import re
         h, w = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
         contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Collect all smallish rectangles (relaxed area range)
-        all_rects = []
+        # Accept any rectangular bordered box of a reasonable size (wider range than
+        # detect_boxed_characters which only looks at tiny isolated squares)
+        candidate_rects = []
         for cnt in contours:
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
@@ -117,108 +122,68 @@ class BoxCharacterDetector:
             aspect = bw / float(bh) if bh > 0 else 0
             contour_area = cv2.contourArea(cnt)
             fill_ratio = contour_area / area if area > 0 else 0
-            if (500 < area < 8000 and
-                0.3 < aspect < 5.0 and
+            # Allow wider boxes (dimension frames are wide): up to 20000 px area
+            # and aspect ratios up to 10 (wide dimension boxes)
+            if (700 < area < 20000 and
+                0.4 < aspect < 10.0 and
                 x > 50 and y > 50 and x + bw < w - 50 and y + bh < h - 50 and
                 fill_ratio > 0.75):
-                all_rects.append((x, y, bw, bh))
+                candidate_rects.append((x, y, bw, bh))
 
-        if not all_rects:
+        if not candidate_rects:
             return []
 
-        # Skip isolated boxes (those are handled by detect_boxed_characters)
-        non_isolated = [r for r in all_rects if not self._is_isolated(r, all_rects)]
+        # Skip rects already covered by existing items (centre inside existing bbox)
+        def overlaps_existing(rx, ry, rw, rh):
+            rcx, rcy = rx + rw / 2, ry + rh / 2
+            for it in existing_items:
+                ix_min = min(p[0] for p in it['bbox'])
+                iy_min = min(p[1] for p in it['bbox'])
+                ix_max = max(p[0] for p in it['bbox'])
+                iy_max = max(p[1] for p in it['bbox'])
+                if ix_min <= rcx <= ix_max and iy_min <= rcy <= iy_max:
+                    return True
+            return False
 
-        # Group non-isolated boxes that are on the same row and touching/close
-        groups = []
-        used = [False] * len(non_isolated)
-        for i, (x, y, bw, bh) in enumerate(non_isolated):
-            if used[i]:
-                continue
-            group = [(x, y, bw, bh)]
-            used[i] = True
-            for j, (ox, oy, obw, obh) in enumerate(non_isolated):
-                if used[j]:
-                    continue
-                # Same row (centres within bh of each other)
-                cy_i, cy_j = y + bh / 2, oy + obh / 2
-                if abs(cy_i - cy_j) > max(bh, obh) * 0.6:
-                    continue
-                # Horizontally close
-                gap = abs(x + bw - ox) if x < ox else abs(ox + obw - x)
-                if gap < 20:
-                    group.append((ox, oy, obw, obh))
-                    used[j] = True
-            if len(group) >= 2:  # Only keep multi-compartment groups
-                groups.append(group)
-
+        # Patterns that are valid annotation content from a bordered box
+        decimal_dim   = re.compile(r'\d+[.,]\d+')
+        datum_ref     = re.compile(r'^[\d.,\s+⊕⌀Øø\|ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg]{1,20}$')
+        
         new_items = []
-        for group in groups:
-            gx_min = min(r[0] for r in group)
-            gy_min = min(r[1] for r in group)
-            gx_max = max(r[0] + r[2] for r in group)
-            gy_max = max(r[1] + r[3] for r in group)
-
-            # --- Guard 1: All boxes in the group must have consistent heights ---
-            # A real GD&T frame has equal-height compartments. Datum circles joined
-            # to dimension boxes will have mismatched heights.
-            heights = [r[3] for r in group]
-            mean_h = sum(heights) / len(heights)
-            if any(abs(r[3] - mean_h) > mean_h * 0.35 for r in group):
-                continue  # height mismatch → skip (mixed box types)
-
-            # --- Guard 2: Skip if any individual box overlaps an existing item ---
-            group_overlaps_existing = False
-            for (bx, by, bw2, bh2) in group:
-                bcx = bx + bw2 / 2
-                bcy = by + bh2 / 2
-                for it in existing_items:
-                    ix_min = min(p[0] for p in it['bbox'])
-                    iy_min = min(p[1] for p in it['bbox'])
-                    ix_max = max(p[0] for p in it['bbox'])
-                    iy_max = max(p[1] for p in it['bbox'])
-                    if ix_min <= bcx <= ix_max and iy_min <= bcy <= iy_max:
-                        group_overlaps_existing = True
-                        break
-                if group_overlaps_existing:
-                    break
-            if group_overlaps_existing:
+        seen_centers = []  # dedup within this pass
+        for (rx, ry, rw, rh) in candidate_rects:
+            # Skip if it overlaps an existing item
+            if overlaps_existing(rx, ry, rw, rh):
                 continue
 
-            # --- Guard 3: Skip if group centre is too close to an existing item ---
-            gcx = (gx_min + gx_max) / 2
-            gcy = (gy_min + gy_max) / 2
-            already = any(
-                abs(sum(p[0] for p in it['bbox']) / 4 - gcx) < 80 and
-                abs(sum(p[1] for p in it['bbox']) / 4 - gcy) < 80
-                for it in existing_items
-            )
-            if already:
+            # Skip title block / notes region
+            rcx = rx + rw / 2
+            rcy = ry + rh / 2
+            if rcx > w * 0.72 and rcy > h * 0.75:
                 continue
 
-            # Skip if in title block / notes area
-            if gcx > w * 0.72 and gcy > h * 0.75:
+            # Dedup within this pass
+            if any(abs(rcx - sc[0]) < 50 and abs(rcy - sc[1]) < 50 for sc in seen_centers):
                 continue
 
-            # OCR the whole group region
-            pad = 5
-            crop = image[max(0, gy_min - pad):gy_max + pad, max(0, gx_min - pad):gx_max + pad]
-            crop_big = cv2.resize(crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-            results = self.reader.readtext(crop_big, paragraph=False)
-            if not results:
-                continue
-            text = ' '.join([r[1] for r in results]).strip()
-            conf = max([r[2] for r in results])
-
-            if not text or conf < 0.1:
+            # OCR the individual box
+            text, conf = self._ocr_box(image, rx, ry, rw, rh)
+            if not text or conf < 0.15:
                 continue
 
-            bbox = [[gx_min, gy_min], [gx_max, gy_min], [gx_max, gy_max], [gx_min, gy_max]]
-            new_items.append({'bbox': bbox, 'text': text, 'confidence': conf, 'source': 'gdt_frame_detector'})
-            print(f"  - GD&T frame detected: '{text}' @ ({gx_min},{gy_min})")
+            clean = text.strip()
+            # Accept only if it contains a decimal dimension OR looks like a datum ref
+            if decimal_dim.search(clean) or datum_ref.match(clean):
+                # Extra sanity: reject very long strings (likely notes sneaking through)
+                if len(clean) > 25:
+                    continue
+                bbox = [[rx, ry], [rx + rw, ry], [rx + rw, ry + rh], [rx, ry + rh]]
+                new_items.append({'bbox': bbox, 'text': clean, 'confidence': conf, 'source': 'gdt_frame_detector'})
+                seen_centers.append((rcx, rcy))
+                print(f"  - GD&T frame detected: '{clean}' @ ({rx},{ry})")
 
         return new_items
-    
+
     def _is_isolated(self, rect, all_rects, margin=5):
         """Check if a rectangle has no touching neighbors on the same row."""
         x, y, bw, bh = rect
