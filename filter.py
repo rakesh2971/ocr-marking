@@ -81,6 +81,8 @@ class AnnotationFilter:
         """
         Notes Rescue Pass: re-admits items whose left edge is clearly in the
         drawing area (more than 200px left of the NOTES header).
+        Also rescues GD&T frames and datum reference letters that are
+        in the drawing but near the notes boundary.
         Returns (rescued_list, still_excluded_list).
         """
         notes_header_x = None
@@ -92,30 +94,51 @@ class AnnotationFilter:
             return [], excluded_notes
 
         rescue_cutoff = notes_header_x - 200
+        
+        # Pattern for GD&T / datum items worth rescuing even if close to notes boundary
+        gdt_frame_pattern = re.compile(
+            r'[\u2295\u2300\u00f8\u25cb\u25c7\u22a5\u2016\+\u2220|\xf8]|'
+            r'^\d+\.\d+\s*[A-Z]?\s*[A-Z]?\s*[A-Z]?$'
+        )
+        
         rescued = []
         still_excluded = []
         for ex_item in excluded_notes:
             item_x_min = min(p[0] for p in ex_item['bbox'])
+            txt = ex_item['text'].strip()
+            
+            # Rescue if clearly in drawing area (well left of notes)
             if item_x_min < rescue_cutoff:
                 rescued.append(ex_item)
-            else:
-                still_excluded.append(ex_item)
+                continue
+                
+            # Also rescue GD&T frames / short datum letters even near notes boundary
+            if gdt_frame_pattern.search(txt) or (len(txt) <= 3 and txt.isalpha() and txt.isupper()):
+                rescued.append(ex_item)
+                continue
+                
+            still_excluded.append(ex_item)
         return rescued, still_excluded
 
     def rescue_gdt_items(self, all_excluded, existing_valid, clean_text_fn=None):
         """
         Generic GD&T Low-Confidence Rescue:
-        Re-admits any filtered item whose normalised text matches the pattern
-        X.XX[optional-letter] (e.g. '0.2 D', '1.2', '3.4').
+        Re-admits any filtered item whose normalised text matches a GD&T pattern:
+        - Simple dimension: X.XX[optional-letter]
+        - GD&T frame with Ø and datum refs: e.g. ⊕ Ø0.5 A B C
+        - Datum reference: single / double uppercase letter(s) in a box
         Dedup: skips if an existing valid item is already within 100px.
-        
-        Args:
-            all_excluded: combined list of all excluded items across all filter passes
-            existing_valid: current list of valid items (dedup reference)
-            clean_text_fn: optional callable to normalise text (extractor.clean_text_content)
-        Returns:
-            list of newly rescued items
         """
+        # Simple dimension
+        simple_dim = re.compile(r'^\d+\.\d+\s*[A-Z]?$')
+        # GD&T frame: optional symbol, Ø or ⌀, number, optional datum letters
+        gdt_frame = re.compile(
+            r'[\u2295\u2300\u00f8\u25cb\u25c7\u22a5\u2016\+\u2220|\xf8Oo\u00d8]'
+            r'.*\d+[.,]\d+'
+        )
+        # Short datum-letter box: 1-3 uppercase letters only
+        datum_ltr = re.compile(r'^[A-Z]{1,3}$')
+        
         gdt_rescued = []
         for ex_item in all_excluded:
             raw_t = ex_item['text'].strip()
@@ -123,7 +146,14 @@ class AnnotationFilter:
             norm = re.sub(r'(\d)\s+\.\s*(\d)', r'\1.\2', norm)
             if clean_text_fn:
                 norm = clean_text_fn(norm).strip()
-            if re.match(r'^\d+\.\d+\s*[A-Z]?$', norm) and len(norm) <= 8:
+
+            is_match = (
+                (simple_dim.match(norm) and len(norm) <= 8) or
+                gdt_frame.search(raw_t) or
+                datum_ltr.match(norm)
+            )
+
+            if is_match:
                 ex_cx = sum(p[0] for p in ex_item['bbox']) / 4
                 ex_cy = sum(p[1] for p in ex_item['bbox']) / 4
                 already = any(

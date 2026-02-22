@@ -105,7 +105,7 @@ def main():
         print(f"Valid items: {len(valid_items)}, Total Excluded: {len(excluded_items)}")
 
         # ── 4. Detect boxed characters ──────────────────────────────────────
-        print("Detecting boxed characters...")
+        print(f"Detecting boxed characters...")
         box_detector = BoxCharacterDetector(extractor.reader)
         boxed_chars = box_detector.detect_boxed_characters(
             image,
@@ -114,6 +114,15 @@ def main():
         )
         print(f"  - Found {len(boxed_chars)} new boxed characters.")
         valid_items = valid_items + boxed_chars
+        
+        # Also detect GD&T feature control frames (multi-compartment boxes like ⊕ Ø0.5 A B C)
+        gdt_frames = box_detector.detect_gdt_frames(
+            image,
+            existing_items=valid_items,
+            exclusion_items=excluded_items
+        )
+        print(f"  - Found {len(gdt_frames)} new GD&T frames.")
+        valid_items = valid_items + gdt_frames
         print(f"Total valid items after box detection: {len(valid_items)}")
 
         # ── 4.5. Vertical text pass (90°CW full-page rotation) ──────────────

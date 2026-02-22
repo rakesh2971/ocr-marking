@@ -91,6 +91,107 @@ class BoxCharacterDetector:
                     })
         
         return new_items
+
+    def detect_gdt_frames(self, image, existing_items=[], exclusion_items=[]):
+        """
+        Detects GD&T feature control frames (multi-compartment horizontal groups of boxes)
+        that are NOT isolated (so they're filtered out by detect_boxed_characters).
+        Groups adjacent boxes in the same row and OCRs the entire group as one item.
+        Also catches datum boxes (single boxed letter) that might have been missed.
+        """
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+        contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Collect all smallish rectangles (relaxed area range)
+        all_rects = []
+        for cnt in contours:
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            if len(approx) != 4:
+                continue
+            x, y, bw, bh = cv2.boundingRect(approx)
+            area = bw * bh
+            aspect = bw / float(bh) if bh > 0 else 0
+            contour_area = cv2.contourArea(cnt)
+            fill_ratio = contour_area / area if area > 0 else 0
+            if (500 < area < 8000 and
+                0.3 < aspect < 5.0 and
+                x > 50 and y > 50 and x + bw < w - 50 and y + bh < h - 50 and
+                fill_ratio > 0.75):
+                all_rects.append((x, y, bw, bh))
+
+        if not all_rects:
+            return []
+
+        # Skip isolated boxes (those are handled by detect_boxed_characters)
+        non_isolated = [r for r in all_rects if not self._is_isolated(r, all_rects)]
+
+        # Group non-isolated boxes that are on the same row and touching/close
+        groups = []
+        used = [False] * len(non_isolated)
+        for i, (x, y, bw, bh) in enumerate(non_isolated):
+            if used[i]:
+                continue
+            group = [(x, y, bw, bh)]
+            used[i] = True
+            for j, (ox, oy, obw, obh) in enumerate(non_isolated):
+                if used[j]:
+                    continue
+                # Same row (centres within bh of each other)
+                cy_i, cy_j = y + bh / 2, oy + obh / 2
+                if abs(cy_i - cy_j) > max(bh, obh) * 0.6:
+                    continue
+                # Horizontally close
+                gap = abs(x + bw - ox) if x < ox else abs(ox + obw - x)
+                if gap < 20:
+                    group.append((ox, oy, obw, obh))
+                    used[j] = True
+            if len(group) >= 2:  # Only keep multi-compartment groups
+                groups.append(group)
+
+        new_items = []
+        for group in groups:
+            gx_min = min(r[0] for r in group)
+            gy_min = min(r[1] for r in group)
+            gx_max = max(r[0] + r[2] for r in group)
+            gy_max = max(r[1] + r[3] for r in group)
+
+            # Check it doesn't overlap with existing items
+            gcx = (gx_min + gx_max) / 2
+            gcy = (gy_min + gy_max) / 2
+            already = any(
+                abs(sum(p[0] for p in it['bbox']) / 4 - gcx) < 80 and
+                abs(sum(p[1] for p in it['bbox']) / 4 - gcy) < 80
+                for it in existing_items
+            )
+            if already:
+                continue
+
+            # Skip if in title block / notes area
+            if gcx > w * 0.72 and gcy > h * 0.75:
+                continue
+
+            # OCR the whole group region
+            pad = 5
+            crop = image[max(0, gy_min - pad):gy_max + pad, max(0, gx_min - pad):gx_max + pad]
+            crop_big = cv2.resize(crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+            results = self.reader.readtext(crop_big, paragraph=False)
+            if not results:
+                continue
+            text = ' '.join([r[1] for r in results]).strip()
+            conf = max([r[2] for r in results])
+
+            if not text or conf < 0.1:
+                continue
+
+            bbox = [[gx_min, gy_min], [gx_max, gy_min], [gx_max, gy_max], [gx_min, gy_max]]
+            new_items.append({'bbox': bbox, 'text': text, 'confidence': conf, 'source': 'gdt_frame_detector'})
+            print(f"  - GD&T frame detected: '{text}' @ ({gx_min},{gy_min})")
+
+        return new_items
     
     def _is_isolated(self, rect, all_rects, margin=5):
         """Check if a rectangle has no touching neighbors on the same row."""
