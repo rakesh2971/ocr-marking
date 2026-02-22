@@ -7,6 +7,12 @@ import re
 try:
     from paddlex.inference.utils import misc
     misc.is_mkldnn_available = lambda: False
+    
+    # Also patch AnalysisConfig to ignore missing set_optimization_level 
+    # when running paddlepaddle 2.6.x
+    import paddle.inference
+    if not hasattr(paddle.inference.Config, 'set_optimization_level'):
+        paddle.inference.Config.set_optimization_level = lambda self, level: None
 except ImportError:
     pass
 
@@ -15,8 +21,12 @@ from paddleocr import PaddleOCR
 class TextExtractor:
     def __init__(self, languages=['en']):
         print("Initializing PaddleOCR...")
-        # Initialize PaddleOCR (angle classification enabled, english language)
-        self.reader = PaddleOCR(use_angle_cls=True, lang='en')
+        # Use locally cached models to avoid network download failures
+        _det_model = r"C:\Users\LENOVO\.paddleocr\whl\det\en\en_PP-OCRv3_det_infer"
+        _rec_model = r"C:\Users\LENOVO\.paddleocr\whl\rec\en\en_PP-OCRv4_rec_infer"
+        self.reader = PaddleOCR(use_angle_cls=True, lang='en',
+                                det_model_dir=_det_model,
+                                rec_model_dir=_rec_model)
 
     def extract_text(self, image):
         """

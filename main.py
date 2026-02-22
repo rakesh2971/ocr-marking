@@ -4,10 +4,24 @@ import csv
 import re
 import cv2
 import numpy as np
+# Force IPv4 resolution to prevent BCEBOS download failures (IPv6 not always routable on Windows)
+import socket as _socket
+_orig_getaddrinfo = _socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+_socket.getaddrinfo = _ipv4_getaddrinfo
 
 # Disable PaddlePaddle PIR and MKLDNN (causes instructions crashes on Windows)
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
+
+# Fix Paddlex API mismatch on PaddlePaddle 2.6.x (AttributeError: set_optimization_level)
+try:
+    import paddle.inference
+    if not hasattr(paddle.inference.Config, 'set_optimization_level'):
+        paddle.inference.Config.set_optimization_level = lambda self, level: None
+except ImportError:
+    pass
 
 from processor import DocumentProcessor
 from extractor import TextExtractor, FullPageRotationDetector
@@ -194,41 +208,41 @@ def main():
                 b_r, (t_r, p_r) = line
                 if p_r < 0.35 or not t_r.strip():
                     continue
-            t_clean = extractor.clean_text_content(t_r.strip())
-            if not re.search(r'\d+[.,]\d+', t_clean) or len(t_clean) > 12:
-                continue
-            if sum(c.isdigit() for c in t_clean) < 2:
-                continue
-            if '=' in t_clean:
-                continue
-            t_clean = t_clean.split(':')[0].strip()
-            if not t_clean:
-                continue
-            # Inverse transform for ROTATE_90_CLOCKWISE on (H, W) image:
-            # original_x (col) = y_r / 2  (row of rotated / scale)
-            # original_y (row) = (H-1) - x_r / 2  (col of rotated / scale, flipped)
-            b_cx_r = sum(pt[0] for pt in b_r) / 4 / 2
-            b_cy_r = sum(pt[1] for pt in b_r) / 4 / 2
-            ax = int(b_cy_r)
-            ay = int((h_img - 1) - b_cx_r)
-            sz_r = 45
-            t_digits = re.sub(r'[^\d]', '', t_clean)
-            already_r = any(
-                (
-                    abs(sum(p[0] for p in ex['bbox']) / 4 - ax) < 100 and
-                    abs(sum(p[1] for p in ex['bbox']) / 4 - ay) < 100
-                ) or (
-                    len(ex['text'].strip()) <= 10 and
-                    re.sub(r'[^\d]', '', ex['text']) == t_digits and
-                    len(t_digits) >= 2
+                t_clean = extractor.clean_text_content(t_r.strip())
+                if not re.search(r'\d+[.,]\d+', t_clean) or len(t_clean) > 12:
+                    continue
+                if sum(c.isdigit() for c in t_clean) < 2:
+                    continue
+                if '=' in t_clean:
+                    continue
+                t_clean = t_clean.split(':')[0].strip()
+                if not t_clean:
+                    continue
+                # Inverse transform for ROTATE_90_CLOCKWISE on (H, W) image:
+                # original_x (col) = y_r / 2  (row of rotated / scale)
+                # original_y (row) = (H-1) - x_r / 2  (col of rotated / scale, flipped)
+                b_cx_r = sum(pt[0] for pt in b_r) / 4 / 2
+                b_cy_r = sum(pt[1] for pt in b_r) / 4 / 2
+                ax = int(b_cy_r)
+                ay = int((h_img - 1) - b_cx_r)
+                sz_r = 45
+                t_digits = re.sub(r'[^\d]', '', t_clean)
+                already_r = any(
+                    (
+                        abs(sum(p[0] for p in ex['bbox']) / 4 - ax) < 100 and
+                        abs(sum(p[1] for p in ex['bbox']) / 4 - ay) < 100
+                    ) or (
+                        len(ex['text'].strip()) <= 10 and
+                        re.sub(r'[^\d]', '', ex['text']) == t_digits and
+                        len(t_digits) >= 2
+                    )
+                    for ex in valid_items
                 )
-                for ex in valid_items
-            )
-            if not already_r:
-                new_bbox_r = [[ax - sz_r, ay - sz_r], [ax + sz_r, ay - sz_r],
-                              [ax + sz_r, ay + sz_r], [ax - sz_r, ay + sz_r]]
-                valid_items.append({'bbox': new_bbox_r, 'text': t_clean, 'confidence': p_r})
-                print(f"  - 90°CW pass rescued: '{t_clean}' @ ({ax},{ay})")
+                if not already_r:
+                    new_bbox_r = [[ax - sz_r, ay - sz_r], [ax + sz_r, ay - sz_r],
+                                  [ax + sz_r, ay + sz_r], [ax - sz_r, ay + sz_r]]
+                    valid_items.append({'bbox': new_bbox_r, 'text': t_clean, 'confidence': p_r})
+                    print(f"  - 90°CW pass rescued: '{t_clean}' @ ({ax},{ay})")
 
         # ── 4.8. GD&T singleton enforcement ─────────────────────────────────
         # Tighten the bbox of any GD&T frame item so it forms its own cluster.
