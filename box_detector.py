@@ -159,7 +159,33 @@ class BoxCharacterDetector:
             gx_max = max(r[0] + r[2] for r in group)
             gy_max = max(r[1] + r[3] for r in group)
 
-            # Check it doesn't overlap with existing items
+            # --- Guard 1: All boxes in the group must have consistent heights ---
+            # A real GD&T frame has equal-height compartments. Datum circles joined
+            # to dimension boxes will have mismatched heights.
+            heights = [r[3] for r in group]
+            mean_h = sum(heights) / len(heights)
+            if any(abs(r[3] - mean_h) > mean_h * 0.35 for r in group):
+                continue  # height mismatch → skip (mixed box types)
+
+            # --- Guard 2: Skip if any individual box overlaps an existing item ---
+            group_overlaps_existing = False
+            for (bx, by, bw2, bh2) in group:
+                bcx = bx + bw2 / 2
+                bcy = by + bh2 / 2
+                for it in existing_items:
+                    ix_min = min(p[0] for p in it['bbox'])
+                    iy_min = min(p[1] for p in it['bbox'])
+                    ix_max = max(p[0] for p in it['bbox'])
+                    iy_max = max(p[1] for p in it['bbox'])
+                    if ix_min <= bcx <= ix_max and iy_min <= bcy <= iy_max:
+                        group_overlaps_existing = True
+                        break
+                if group_overlaps_existing:
+                    break
+            if group_overlaps_existing:
+                continue
+
+            # --- Guard 3: Skip if group centre is too close to an existing item ---
             gcx = (gx_min + gx_max) / 2
             gcy = (gy_min + gy_max) / 2
             already = any(
