@@ -305,11 +305,11 @@ class BoxCharacterDetector:
         # Upscale for better OCR accuracy
         crop_big = cv2.resize(crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
         
-        results = self.reader.readtext(crop_big)
+        results = self.reader.ocr(crop_big)
         
-        if results:
-            text = ' '.join([r[1] for r in results]).strip()
-            conf = max([r[2] for r in results])
+        if results and results[0]:
+            text = ' '.join([r[1][0] for r in results[0]]).strip()
+            conf = max([r[1][1] for r in results[0]])
             return text, conf
         
         return '', 0.0

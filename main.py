@@ -1,10 +1,14 @@
-
 import argparse
 import os
 import csv
 import re
 import cv2
 import numpy as np
+
+# Disable PaddlePaddle PIR and MKLDNN (causes instructions crashes on Windows)
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "0"
+
 from processor import DocumentProcessor
 from extractor import TextExtractor, FullPageRotationDetector
 from filter import AnnotationFilter
@@ -183,11 +187,13 @@ def main():
         rot90 = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         rot90_gray = cv2.cvtColor(rot90, cv2.COLOR_BGR2GRAY)
         rot90_up = cv2.resize(rot90_gray, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)
-        rot90_results = extractor.reader.readtext(rot90_up, paragraph=False, contrast_ths=0.1)
+        rot90_results = extractor.reader.ocr(rot90_up)
 
-        for (b_r, t_r, p_r) in rot90_results:
-            if p_r < 0.35 or not t_r.strip():
-                continue
+        if rot90_results and rot90_results[0]:
+            for line in rot90_results[0]:
+                b_r, (t_r, p_r) = line
+                if p_r < 0.35 or not t_r.strip():
+                    continue
             t_clean = extractor.clean_text_content(t_r.strip())
             if not re.search(r'\d+[.,]\d+', t_clean) or len(t_clean) > 12:
                 continue

@@ -1,14 +1,22 @@
-
-import easyocr
 import numpy as np
 import cv2
 import re
 
+# Monkey-patch paddlex to disable mkldnn completely, 
+# preventing the ConvertPirAttribute2RuntimeAttribute bug on Windows CPU
+try:
+    from paddlex.inference.utils import misc
+    misc.is_mkldnn_available = lambda: False
+except ImportError:
+    pass
+
+from paddleocr import PaddleOCR
 
 class TextExtractor:
     def __init__(self, languages=['en']):
-        print("Initializing EasyOCR...")
-        self.reader = easyocr.Reader(languages)
+        print("Initializing PaddleOCR...")
+        # Initialize PaddleOCR (angle classification enabled, english language)
+        self.reader = PaddleOCR(use_angle_cls=True, lang='en')
 
     def extract_text(self, image):
         """
@@ -18,16 +26,18 @@ class TextExtractor:
         if not isinstance(image, np.ndarray):
             raise ValueError("Image must be a numpy array")
 
-        results = self.reader.readtext(image)
+        results = self.reader.ocr(image)
         
         text_items = []
-        for (bbox, text, prob) in results:
-            if prob > 0.2:
-                text_items.append({
-                    'bbox': bbox,
-                    'text': text,
-                    'confidence': prob
-                })
+        if results and results[0]:
+            for line in results[0]:
+                bbox, (text, prob) = line
+                if prob > 0.2:
+                    text_items.append({
+                        'bbox': bbox,
+                        'text': text,
+                        'confidence': prob
+                    })
         
         horizontal_merged = self.merge_horizontal_items(text_items)
         final_merged = self.merge_vertical_items(horizontal_merged)
@@ -47,11 +57,13 @@ class TextExtractor:
         if not isinstance(image, np.ndarray):
             raise ValueError("Image must be a numpy array")
 
-        raw_results = self.reader.readtext(image)
+        raw_results = self.reader.ocr(image)
         raw_items = []
-        for (bbox, text, prob) in raw_results:
-            if prob > 0.2:
-                raw_items.append({'bbox': bbox, 'text': text, 'confidence': prob})
+        if raw_results and raw_results[0]:
+            for line in raw_results[0]:
+                bbox, (text, prob) = line
+                if prob > 0.2:
+                    raw_items.append({'bbox': bbox, 'text': text, 'confidence': prob})
 
         h_merged = self.merge_horizontal_items(raw_items, x_threshold=x_threshold)
         v_merged = self.merge_vertical_items(h_merged)
@@ -557,39 +569,41 @@ class FullPageRotationDetector:
         rotated_image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         rot_h, rot_w = rotated_image.shape[:2]  # rot_h = w, rot_w = h
 
-        results = self.reader.readtext(rotated_image, paragraph=False, width_ths=0.7)
+        results = self.reader.ocr(rotated_image)
 
         new_items = []
-        for bbox, text, conf in results:
-            if conf < 0.2:
-                continue
-            clean_text = text.strip()
-            if not re.search(r'\d', clean_text):
-                continue
-            if len(clean_text) < 3 or len(clean_text) > 15:
-                continue
-            if not re.match(r'^[\d\.\-\+\s,]+$', clean_text):
-                if not re.match(r'^[\d\.\-\+\sA-Za-z]+$', clean_text):
+        if results and results[0]:
+            for line in results[0]:
+                bbox, (text, conf) = line
+                if conf < 0.2:
                     continue
-                alphas = sum(c.isalpha() for c in clean_text)
-                digits = sum(c.isdigit() for c in clean_text)
-                if alphas >= digits:
+                clean_text = text.strip()
+                if not re.search(r'\d', clean_text):
                     continue
+                if len(clean_text) < 3 or len(clean_text) > 15:
+                    continue
+                if not re.match(r'^[\d\.\-\+\s,]+$', clean_text):
+                    if not re.match(r'^[\d\.\-\+\sA-Za-z]+$', clean_text):
+                        continue
+                    alphas = sum(c.isalpha() for c in clean_text)
+                    digits = sum(c.isdigit() for c in clean_text)
+                    if alphas >= digits:
+                        continue
 
-            # Inverse transform for 90°CW: (rot_x, rot_y) -> orig (rot_y, rot_w - rot_x)
-            original_bbox = []
-            for point in bbox:
-                rot_x, rot_y = point
-                orig_x = rot_y
-                orig_y = rot_w - rot_x
-                original_bbox.append([orig_x, orig_y])
+                # Inverse transform for 90°CW: (rot_x, rot_y) -> orig (rot_y, rot_w - rot_x)
+                original_bbox = []
+                for point in bbox:
+                    rot_x, rot_y = point
+                    orig_x = rot_y
+                    orig_y = rot_w - rot_x
+                    original_bbox.append([orig_x, orig_y])
 
-            new_items.append({
-                'bbox': original_bbox,
-                'text': clean_text,
-                'confidence': conf,
-                'source': 'full_page_rotation',
-                'orientation': 'vertical'
-            })
+                new_items.append({
+                    'bbox': original_bbox,
+                    'text': clean_text,
+                    'confidence': conf,
+                    'source': 'full_page_rotation',
+                    'orientation': 'vertical'
+                })
 
         return new_items
