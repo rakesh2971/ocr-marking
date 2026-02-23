@@ -169,45 +169,67 @@ class AnnotationFilter:
         return gdt_rescued
 
     def filter_bottom_right_table(self, text_items, image_shape):
-        """Filters out text in the bottom-right parts/material table."""
+        """Filters out text in the BOM/parts table, searching bottom 60% of page.
+        
+        Two-phase strategy:
+          Phase 1 — find TABLE NO title (acts as bottom reference)
+          Phase 2 — scan up to find column headers (DESCRIPTION, ITEM PART NO)
+          Use the topmost header as the real upper cutoff.
+        """
         if not text_items:
             return text_items, []
         h, w = image_shape[:2]
-        search_x_min = w / 2
-        search_y_min = h / 2
-        anchors = ["TABLE NO", "COATING WEIGHT", "MATERAIL", "MATERIAL", "ITEM PART NO", "DESCRIPTION"]
-        table_top_y = h
-        table_left_x = w
-        found_anchor = False
+        # Search the bottom 60% of the page for any table-related anchor
+        search_y_min = h * 0.40
+        title_anchors   = ["TABLE NO", "TABLE NO."]
+        header_anchors  = [
+            "DESCRIPTION", "ITEM PART NO", "ITEMPART NO",
+            "COATING WEIGHT", "MATERAIL", "MATERIAL", "PART NO"
+        ]
+
+        # ── Phase 1: find TABLE NO (bottom-most definitive row) ──────────
+        table_title_y = None
         for item in text_items:
             text = item['text'].strip().upper()
-            bbox = item['bbox']
-            x_min = min([p[0] for p in bbox])
-            y_min = min([p[1] for p in bbox])
-            if x_min > search_x_min and y_min > search_y_min:
-                is_anchor = any(anchor in text for anchor in anchors)
-                if is_anchor:
-                    found_anchor = True
-                    if y_min < table_top_y:
-                        table_top_y = y_min
-                    if x_min < table_left_x:
-                        table_left_x = x_min
-        if not found_anchor:
-            print("Warning: Table anchors not found in bottom-right. Skipping table filtering.")
+            if not any(a in text for a in title_anchors):
+                continue
+            y_min = min(p[1] for p in item['bbox'])
+            if y_min < search_y_min:
+                continue
+            if table_title_y is None or y_min > table_title_y:
+                table_title_y = y_min          # bottommost title row
+
+        if table_title_y is None:
+            print("Warning: TABLE NO anchor not found. Skipping table filtering.")
             return text_items, []
+
+        # ── Phase 2: scan up to find header row (real table top) ─────────
+        # Look within 35% of page height above the title row
+        scan_top = max(0, table_title_y - h * 0.35)
+        table_top_y = table_title_y           # start pessimistic; improve below
+        for item in text_items:
+            text = item['text'].strip().upper()
+            if not any(a in text for a in header_anchors):
+                continue
+            y_min = min(p[1] for p in item['bbox'])
+            if scan_top <= y_min <= table_title_y:
+                if y_min < table_top_y:
+                    table_top_y = y_min        # move cutoff up
+
         cutoff_y = table_top_y - 20
-        cutoff_x = table_left_x - 20
+        print(f"  [table filter] title_y={table_title_y:.0f}, top_y={table_top_y:.0f}, cutoff_y={cutoff_y:.0f}")
+
         valid_items = []
         excluded_items = []
         for item in text_items:
-            bbox = item['bbox']
-            x_min = min([p[0] for p in bbox])
-            y_min = min([p[1] for p in bbox])
-            if x_min >= cutoff_x and y_min >= cutoff_y:
+            y_min = min(p[1] for p in item['bbox'])
+            if y_min >= cutoff_y:
                 excluded_items.append(item)
             else:
                 valid_items.append(item)
+        self._table_cutoff_y = cutoff_y   # expose for fallback OCR guard in main.py
         return valid_items, excluded_items
+
 
     def filter_view_labels(self, text_items):
         """Filters view labels (SECTION, VIEW, FP56, etc.) unless they contain dimensions."""

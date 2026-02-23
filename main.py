@@ -51,6 +51,11 @@ def main():
     visualizer = Visualizer()
     clusterer = MorphologicalClusterer()
 
+    # Initialise EasyOCR once for the targeted fallback pass
+    import easyocr as _easyocr
+    from fallback_ocr import find_missing_zones, run_fallback_ocr_on_zones
+    easy_reader = _easyocr.Reader(['en'], gpu=False, verbose=False)
+
     print(f"Processing {args.input}...")
 
     images = processor.pdf_to_images(args.input, zoom=args.zoom)
@@ -101,7 +106,9 @@ def main():
         print(f"  - Removed {len(excluded_table)} items from Bottom-Right Table.")
 
         # C2. Generic GD&T low-confidence rescue
-        all_excluded_so_far = excluded_datums + excluded_notes + excluded_table
+        # NOTE: deliberately exclude excluded_table so that table data like
+        # "680.1" or "34" are not mistaken for engineering dimensions.
+        all_excluded_so_far = excluded_datums + excluded_notes
         gdt_rescued = annot_filter.rescue_gdt_items(
             all_excluded_so_far,
             valid_items_3,
@@ -120,6 +127,19 @@ def main():
 
         excluded_items = (excluded_datums + excluded_notes + excluded_table
                           + excluded_views + excluded_top_left)
+
+        # F. Final text-pattern cleanup: drop 8+ digit part numbers and
+        #    table header fragments that slip through spatial filters.
+        import re as _re
+        _PARTNUM = _re.compile(r'^\d{8,}$')
+        _TABLE_HEADERS = {'TABLE NO', 'ITEMPART NO', 'ITEM PART NO', 'DESCRIPTION'}
+        _pre_cleanup = len(valid_items)
+        valid_items = [
+            it for it in valid_items
+            if not _PARTNUM.match(it.get('text', '').strip())
+            and it.get('text', '').strip().upper() not in _TABLE_HEADERS
+        ]
+        print(f"  - Removed {_pre_cleanup - len(valid_items)} items by text-pattern cleanup (part numbers / table headers).")
         print(f"Valid items: {len(valid_items)}, Total Excluded: {len(excluded_items)}")
 
         # ── 4. Detect boxed characters ──────────────────────────────────────
@@ -272,10 +292,78 @@ def main():
             if 'type' not in item:
                 item['type'] = extractor.classify_token(item['text'])
 
+        # ── 4.10b. Final universal text-pattern sweep ─────────────────────────
+        # Runs AFTER all item sources (PaddleOCR, box_detector, vertical, 90°CW).
+        # Catches items like 548232103801 added by box_detector AFTER step F.
+        import re as _re2
+        _PARTNUM2 = _re2.compile(r'^\d{8,}$')
+        _TABLE_HDR2 = {'TABLE NO', 'ITEMPART NO', 'ITEM PART NO', 'DESCRIPTION'}
+        _n_before = len(valid_items)
+        valid_items = [
+            it for it in valid_items
+            if not _PARTNUM2.match(it.get('text', '').strip())
+            and it.get('text', '').strip().upper() not in _TABLE_HDR2
+        ]
+        if _n_before != len(valid_items):
+            print(f"  - Universal sweep removed {_n_before - len(valid_items)} part-number/table items.")
+
         # ── 5. Group by drawing views + sort in reading order ─────────────────
         print("Grouping annotations by drawing views...")
-        cluster_info, _ = clusterer.get_clusters(image, valid_items, exclusion_items=excluded_items)
+        cluster_info, _, view_rects_map = clusterer.get_clusters(image, valid_items, exclusion_items=excluded_items)
         print(f"Views detected: {len(cluster_info)}")
+
+        # ── 5.5. Targeted fallback OCR on under-populated view clusters ────────────
+        # Only triggers for clusters with very few DIMENSION/GDT tokens relative to view area.
+        # Runs EasyOCR only on crop zones where dimension lines have no nearby text.
+        for vi, min_x_v, centroid_y_v, cluster_items in cluster_info:
+            numeric_count = sum(
+                1 for it in cluster_items
+                if it.get('type') in {'DIMENSION', 'GDT'}
+            )
+            rect = view_rects_map.get(vi)
+            if rect is None:
+                continue
+            rx, ry, rw, rh = rect
+
+            # Skip views that overlap with the BOM/material table zone.
+            # _table_cutoff_y is set by filter_bottom_right_table.
+            _table_guard = getattr(annot_filter, '_table_cutoff_y', image.shape[0])
+            if ry + rh * 0.5 > _table_guard:
+                continue
+
+            area = rw * rh
+            density = numeric_count / max(area, 1)
+
+            # Skip healthy clusters
+            if numeric_count >= 3 and density >= 0.000002:
+                continue
+
+            # Correct colour-space conversion (image may be BGR in this pipeline)
+            view_crop = image[ry:ry + rh, rx:rx + rw]
+            if len(view_crop.shape) == 3:
+                view_gray = cv2.cvtColor(view_crop, cv2.COLOR_BGR2GRAY)
+            else:
+                view_gray = view_crop
+
+            zones = find_missing_zones(view_gray, cluster_items, rx, ry)
+            if not zones:
+                continue
+
+            new_items = run_fallback_ocr_on_zones(image, zones, easy_reader, extractor)
+            if new_items:
+                # Strip any part numbers that slipped past _is_useful_token
+                new_items = [
+                    it for it in new_items
+                    if not _PARTNUM2.match(it.get('text', '').strip())
+                ]
+                cluster_items.extend(new_items)
+                # Re-sort in reading order after insertion
+                cluster_items.sort(key=lambda it: (
+                    min(p[1] for p in it['bbox']),
+                    min(p[0] for p in it['bbox'])
+                ))
+                valid_items.extend(new_items)
+                print(f"  Fallback OCR rescued {len(new_items)} item(s) in view {vi}")
 
         # ── 6. Visualize (draw per-cluster numbering) ───────────────
         annotated_img = image.copy()

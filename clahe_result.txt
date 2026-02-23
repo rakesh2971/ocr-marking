@@ -1,0 +1,6 @@
+[DEFAULT    det_thresh=0.3 box_thresh=0.6] total=119
+  NOT FOUND
+[SENSITIVE  det_thresh=0.2 box_thresh=0.4] total=140
+  NOT FOUND
+[VERY_SENS  det_thresh=0.1 box_thresh=0.3] total=143
+  NOT FOUND

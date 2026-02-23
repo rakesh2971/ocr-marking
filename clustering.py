@@ -205,4 +205,4 @@ class MorphologicalClusterer:
             )
             cv2.rectangle(labeled_img, (rx, ry), (rx + rw, ry + rh), color, 2)
 
-        return cluster_info, labeled_img
+        return cluster_info, labeled_img, {vi: view_rects[vi] for vi in range(len(view_rects))}
