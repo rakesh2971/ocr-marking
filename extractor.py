@@ -93,16 +93,9 @@ class TextExtractor:
         for item in valid_items:
             item["type"] = self.classify_token(item["text"])
 
-        # Step 6: final single-letter drop (non-datum letters)
-        result = []
-        for item in valid_items:
-            clean_t = item['text'].replace('.', '').strip()
-            if len(clean_t) == 1 and clean_t.isalpha():
-                if clean_t.upper() not in ['X', 'Y', 'Z']:
-                    continue
-            result.append(item)
-
-        return result
+        # Step 6 (removed): single-letter drop was here but killed valid FEATURE_LABELs
+        # Classification now handles this contextually via FEATURE_LABEL vs OTHER.
+        return valid_items
 
     def repair_numeric_strings(self, text):
         """
@@ -139,28 +132,33 @@ class TextExtractor:
     def classify_token(self, text):
         t = text.strip()
 
-        # DATUM BUBBLE — single letter + digit, with optional surrounding brackets/spaces
-        # Covers: A1, (A1), [A1], " A1 "
+        # 1. DATUM BUBBLE — letter + digit, with optional brackets
         if re.match(r'^[\(\[\s]*[A-Z]\d+[\)\]\s]*$', t):
             return "DATUM_BUBBLE"
 
-        # GD&T FRAME — contains pipe separators or parenthesised datum refs
+        # 2. FEATURE LABEL — single uppercase letter (hole ref, section tag, view label)
+        #    Exclude I / O / S which are common OCR noise from geometry lines/curves
+        if re.match(r'^[A-Z]$', t) and t not in {"I", "O", "S"}:
+            return "FEATURE_LABEL"
+
+        # 3. GD&T FRAME — pipe separators or parenthesised datum refs
         if "|" in t or re.search(r'\(.*\)', t):
             return "GDT"
 
-        # PURE NUMERIC DIMENSION — integer or decimal, optional leading ±/+/-
+        # 4. NUMERIC DIMENSION — integer or decimal, optional leading ±/+/-
         if re.match(r'^[±\+\-]?\d+(\.\d+)?$', t):
             return "DIMENSION"
 
-        # DIAMETER / RADIUS PREFIX DIMENSION
+        # 4b. DIAMETER / RADIUS PREFIX DIMENSION
         if re.search(r'[ØR]\s*\d', t):
             return "DIMENSION"
 
-        # NOTE — contains 2+ letters AND no digits (avoids misclassifying "57.7 A B C")
+        # 5. NOTE — 2+ letters AND no digits  (won't swallow FEATURE_LABEL — checked above)
         if re.search(r'[A-Za-z]{2,}', t) and not re.search(r'\d', t):
             return "NOTE"
 
         return "OTHER"
+
 
     def apply_decimal_stitcher(self, items):
         """

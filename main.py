@@ -304,7 +304,7 @@ def main():
     # ── 8. Save CSV (TPEM Technical Review Sheet format) ────────────────────
     # S.No. is per-page (cluster-wise); Page column identifies the sheet.
     # Only export DIMENSION, GDT, NOTE — skip DATUM_BUBBLE and OTHER.
-    _EXPORT_TYPES = {"DIMENSION", "GDT", "NOTE"}
+    _EXPORT_TYPES = {"DIMENSION", "GDT", "NOTE", "FEATURE_LABEL"}
     print(f"Saving mapping to {args.output_csv}...")
     with open(args.output_csv, 'w', newline='', encoding='utf-8-sig') as csvfile:
         fieldnames = ['Page', 'S.No.', 'Parameters Critical to fitment & Function']
