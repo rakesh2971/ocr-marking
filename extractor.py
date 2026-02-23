@@ -153,8 +153,16 @@ class TextExtractor:
         if re.search(r'[ØR]\s*\d', t):
             return "DIMENSION"
 
-        # 5. NOTE — 2+ letters AND no digits  (won't swallow FEATURE_LABEL — checked above)
-        if re.search(r'[A-Za-z]{2,}', t) and not re.search(r'\d', t):
+        # 5. NOTE — whole-word keyword match against functional engineering terms
+        #    Uses word extraction to avoid substring false-positives
+        #    (e.g. "EXAMPLE" must not match keyword "MAX")
+        NOTE_KEYWORDS = {
+            "THICKNESS", "WALL", "POINT", "EDGE",
+            "DATUM", "SURFACE", "BREAK", "HOLE",
+            "MIN", "MAX", "CONTROL", "ONLY"
+        }
+        words = re.findall(r'[A-Z]+', t.upper())
+        if any(w in NOTE_KEYWORDS for w in words):
             return "NOTE"
 
         return "OTHER"
