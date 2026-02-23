@@ -293,7 +293,9 @@ def main():
 
             all_mappings.extend(page_mappings)
 
-            page_counter += len(cluster_items)
+            # Advance counter only by DRAWN items (page_mappings), not all cluster_items.
+            # Using len(cluster_items) created phantom IDs for skipped items, causing gaps.
+            page_counter += len(page_mappings)
 
         annotated_images.append(annotated_img)
 
@@ -303,16 +305,14 @@ def main():
 
     # ── 8. Save CSV (TPEM Technical Review Sheet format) ────────────────────
     # S.No. is per-page (cluster-wise); Page column identifies the sheet.
-    # Only export DIMENSION, GDT, NOTE — skip DATUM_BUBBLE and OTHER.
-    _EXPORT_TYPES = {"DIMENSION", "GDT", "NOTE", "FEATURE_LABEL"}
+    # Export ALL drawn items — DRAW_TYPES in visualizer already controls what's drawn,
+    # so every item here belongs to a meaningful annotation type.
     print(f"Saving mapping to {args.output_csv}...")
     with open(args.output_csv, 'w', newline='', encoding='utf-8-sig') as csvfile:
         fieldnames = ['Page', 'S.No.', 'Parameters Critical to fitment & Function']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for row in all_mappings:
-            if row.get('type') not in _EXPORT_TYPES:
-                continue
             writer.writerow({
                 'Page': row['page'],
                 'S.No.': row['id'],
