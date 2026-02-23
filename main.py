@@ -356,6 +356,35 @@ def main():
                     it for it in new_items
                     if not _PARTNUM2.match(it.get('text', '').strip())
                 ]
+
+                # ── View-label proximity guard ─────────────────────────────
+                # Fallback OCR runs after filter_view_labels, so rescued items
+                # can land next to view-title text (e.g. "6" beside SECTION VIEW A-A).
+                # Drop any rescued item whose centre is within 150 px of an
+                # already-excluded view-label centroid.
+                _VL_PROX = 150
+                _excl_vl_centres = [
+                    (sum(p[0] for p in ex['bbox']) / 4,
+                     sum(p[1] for p in ex['bbox']) / 4)
+                    for ex in excluded_views
+                ]
+                _filtered_items = []
+                for _it in new_items:
+                    _cx = sum(p[0] for p in _it['bbox']) / 4
+                    _cy = sum(p[1] for p in _it['bbox']) / 4
+                    _near = any(
+                        abs(_cx - _ex_cx) < _VL_PROX and abs(_cy - _ex_cy) < _VL_PROX
+                        for _ex_cx, _ex_cy in _excl_vl_centres
+                    )
+                    if _near:
+                        print(f"  - Fallback OCR proximity drop: '{_it['text']}' @ ({int(_cx)},{int(_cy)}) near view label")
+                    else:
+                        _filtered_items.append(_it)
+                new_items = _filtered_items
+                # ─────────────────────────────────────────────────────────
+
+                if not new_items:
+                    continue
                 cluster_items.extend(new_items)
                 # Re-sort in reading order after insertion
                 cluster_items.sort(key=lambda it: (

@@ -90,14 +90,17 @@ def find_missing_zones(view_gray, items, rx, ry, line_pad=40):
 _DIM_PATTERN = re.compile(r'^\d+([.,]\d+)?$')
 _GDT_PATTERN = re.compile(r'[\d.,±\+\-\(\)\|]')
 _PART_NUM_PATTERN = re.compile(r'^\d{8,}$')   # 8+ digits = part number, not a dimension
+_SECTION_CUT_PATTERN = re.compile(r'^[A-Z]-[A-Z]$')  # B-B, A-A, D-D section labels
 
 
 def _is_useful_token(text):
-    """Keep numeric dimensions and GD&T-like tokens. Drop pure letters / noise / part numbers."""
+    """Keep numeric dimensions and GD&T-like tokens. Drop pure letters / noise / part numbers / section labels."""
     t = text.strip()
     if not t:
         return False
-    if _PART_NUM_PATTERN.match(t):       # reject 8+ digit part numbers
+    if _PART_NUM_PATTERN.match(t):              # reject 8+ digit part numbers
+        return False
+    if _SECTION_CUT_PATTERN.match(t.upper()):   # reject section-cut labels like B-B
         return False
     if _DIM_PATTERN.match(t):
         return True

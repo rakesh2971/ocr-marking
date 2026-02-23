@@ -232,23 +232,83 @@ class AnnotationFilter:
 
 
     def filter_view_labels(self, text_items):
-        """Filters view labels (SECTION, VIEW, FP56, etc.) unless they contain dimensions."""
+        """Filters view labels (SECTION, VIEW, FP56, B-B, etc.) unless they contain dimensions."""
         valid_items = []
         excluded_items = []
-        keywords = ["VIEW", "SECTION", "DETAIL", "FRONT", "SIDE", "PT6", "PT3", "FP4", "FP3", "FP56"]
+        keywords = [
+            "VIEW", "SECTION", "DETAIL", "FRONT", "SIDE",
+            "PT6", "PT3", "FP4", "FP3", "FP56",
+            "CLEARANCE", "SCALE",
+        ]
+
+        # ── Regex patterns for view/section title forms ──────────────────────
+        # Any two-letter section-cut: A-Z dash A-Z  (covers B-B, D-D, A-B, etc.)
+        section_cut = re.compile(r'^[A-Z]-[A-Z]$')
+        # "VIEW B", "VIEW A", "VIEW AB" (standalone letter(s) after VIEW keyword)
+        view_letter = re.compile(r'^VIEW\s+[A-Z]{1,3}$')
+        # "SECTION VIEW D-D", "SECTION A-A"
+        section_view = re.compile(r'^SECTION(?:\s+VIEW)?\s+[A-Z]-[A-Z]$')
+        # Standalone FP codes: FP3, FP56, FP123, PT3, PT6 …
+        fp_code = re.compile(r'^(?:FP|PT)\d+$')
+        # Phrases like "CLEARANCE HOLE DETAIL", "FP3 MIN FLAT DETAIL", "MIN FLAT DETAIL"
+        detail_phrase = re.compile(
+            r'(?:CLEARANCE\s+HOLE\s+DETAIL|MIN(?:IMUM)?\s+FLAT\s+DETAIL'
+            r'|FP\d+\s+MIN\s+FLAT\s+DETAIL)'
+        )
+        # Scale lines: "SCALE 1:2", "SCALE 2:1"
+        scale_line = re.compile(r'^SCALE\s+\d+:\d+$')
+
         dimension_pattern = re.compile(r'\d+\.\d+|X\s*Y\s*Z|X\s*Y|\bX\b|\bY\b|\bZ\b')
+
         for item in text_items:
-            text = item['text'].upper()
-            is_view_label = any(kw in text for kw in keywords)
+            text = item['text'].strip()
+            text_up = text.upper()
+
+            # ── Hard-exclude by regex (regardless of dimension content) ──────
+            if (section_cut.match(text_up)
+                    or view_letter.match(text_up)
+                    or section_view.match(text_up)
+                    or fp_code.match(text_up)
+                    or detail_phrase.search(text_up)
+                    or scale_line.match(text_up)):
+                excluded_items.append(item)
+                continue
+
+            # ── Soft-exclude by keyword (skip if contains a real dimension) ──
+            is_view_label = any(kw in text_up for kw in keywords)
             if is_view_label:
-                has_dimensions = dimension_pattern.search(text) is not None
+                has_dimensions = dimension_pattern.search(text_up) is not None
                 if has_dimensions:
                     valid_items.append(item)
                 else:
                     excluded_items.append(item)
             else:
                 valid_items.append(item)
+
+        # ── Proximity sweep: remove valid items that are split OCR prefixes ──
+        # If a valid item sits on the same text row and immediately to the LEFT
+        # of an excluded view label, it's a prefix fragment (e.g. "6" from "PT6").
+        # Threshold: within 25px vertically, within 250px horizontally to the left.
+        swept_valid = []
+        for item in valid_items:
+            ci_cx = sum(p[0] for p in item['bbox']) / 4
+            ci_cy = sum(p[1] for p in item['bbox']) / 4
+            is_prefix = False
+            for ex in excluded_items:
+                ex_x_min = min(p[0] for p in ex['bbox'])
+                ex_cy    = sum(p[1] for p in ex['bbox']) / 4
+                if (abs(ci_cy - ex_cy) < 25                # same row
+                        and 0 < ex_x_min - ci_cx < 250):   # item to the left
+                    is_prefix = True
+                    break
+            if is_prefix:
+                excluded_items.append(item)
+            else:
+                swept_valid.append(item)
+        valid_items = swept_valid
+
         return valid_items, excluded_items
+
 
     def filter_top_left_numbers(self, text_items, image_shape):
         """Filters garbage sheet numbers in the extreme top-left corner."""
