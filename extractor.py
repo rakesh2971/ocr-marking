@@ -483,9 +483,16 @@ class TextExtractor:
 
                 xs = [p[0] for g in group for p in g['bbox']]
                 ys = [p[1] for g in group for p in g['bbox']]
+
+                # Proportional padding: scales with text size, works across all DPI
+                width = max(xs) - min(xs)
+                height = max(ys) - min(ys)
+                PAD_X = max(6, int(0.12 * width))
+                PAD_Y = max(2, int(0.08 * height))
+
                 new_bbox = [
-                    [min(xs), min(ys)], [max(xs), min(ys)],
-                    [max(xs), max(ys)], [min(xs), max(ys)]
+                    [min(xs)-PAD_X, min(ys)-PAD_Y], [max(xs)+PAD_X, min(ys)-PAD_Y],
+                    [max(xs)+PAD_X, max(ys)+PAD_Y], [min(xs)-PAD_X, max(ys)+PAD_Y]
                 ]
 
                 merged.append({
@@ -702,8 +709,20 @@ class FullPageRotationDetector:
                     orig_y = rot_w - rot_x
                     original_bbox.append([orig_x, orig_y])
 
+                # Proportional padding: prevents tight/narrow vertical boxes
+                xs_b = [p[0] for p in original_bbox]
+                ys_b = [p[1] for p in original_bbox]
+                width_b = max(xs_b) - min(xs_b)
+                height_b = max(ys_b) - min(ys_b)
+                PAD_X = max(6, int(0.12 * width_b))
+                PAD_Y = max(2, int(0.08 * height_b))
+                padded_bbox = [
+                    [min(xs_b)-PAD_X, min(ys_b)-PAD_Y], [max(xs_b)+PAD_X, min(ys_b)-PAD_Y],
+                    [max(xs_b)+PAD_X, max(ys_b)+PAD_Y], [min(xs_b)-PAD_X, max(ys_b)+PAD_Y]
+                ]
+
                 new_items.append({
-                    'bbox': original_bbox,
+                    'bbox': padded_bbox,
                     'text': clean_text,
                     'confidence': conf,
                     'source': 'full_page_rotation',
