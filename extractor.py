@@ -87,15 +87,20 @@ class TextExtractor:
                     raw_items.append({'bbox': bbox, 'text': text, 'confidence': prob})
 
         # Step 4: remove noise/garbage tokens
-        valid_items = self.cleanup_items(raw_items)
+        cleaned_items = self.cleanup_items(raw_items)
+
+        # Step 4.5: Reconstruct fragmented GD&T rows (horizontally split by OCR spacing)
+        merged_items = self.merge_gdt_rows(cleaned_items, y_thresh=15, x_gap=45)
+        for item in merged_items:
+            item["text"] = self.repair_numeric_strings(item["text"])
 
         # Step 5: classify each token type for downstream logic
-        for item in valid_items:
+        for item in merged_items:
             item["type"] = self.classify_token(item["text"])
 
         # Step 6 (removed): single-letter drop was here but killed valid FEATURE_LABELs
         # Classification now handles this contextually via FEATURE_LABEL vs OTHER.
-        return valid_items
+        return merged_items
 
     def repair_numeric_strings(self, text):
         """
@@ -421,6 +426,77 @@ class TextExtractor:
         text = re.sub(r'\b0\s+1\b', '0.1', text)
         text = text.replace('~', '')
         return text.strip()
+
+    def merge_gdt_rows(self, items, y_thresh=15, x_gap=40):
+        """
+        Reconstructs GD&T rows that PaddleOCR fragments horizontally due to spacing.
+        Example: ['6.8', 'Z', '(0.3)', 'Z'] -> '6.8 Z (0.3) Z'
+        Includes a semantic guard to avoid merging unrelated items like '8.86' and 'Z'.
+        """
+        merged = []
+        used = set()
+
+        # Sort top-to-bottom (center Y), then left-to-right
+        items_sorted = sorted(items, key=lambda i: (
+            sum(p[1] for p in i['bbox']) / 4, 
+            sum(p[0] for p in i['bbox']) / 4
+        ))
+
+        for i, item in enumerate(items_sorted):
+            if i in used:
+                continue
+
+            group = [item]
+            used.add(i)
+
+            x1 = max(p[0] for p in item['bbox'])
+            y1 = sum(p[1] for p in item['bbox']) / 4
+
+            for j in range(i+1, len(items_sorted)):
+                if j in used:
+                    continue
+
+                other = items_sorted[j]
+                x2 = min(p[0] for p in other['bbox'])
+                y2 = sum(p[1] for p in other['bbox']) / 4
+
+                same_row = abs(y1 - y2) < y_thresh
+                close = 0 < (x2 - x1) < x_gap
+
+                # Semantic guard: only merge if tokens look like GD&T parts
+                gdt_like = (
+                    "(" in item["text"] or "(" in other["text"] or
+                    "|" in item["text"] or "|" in other["text"] or
+                    len(item["text"]) <= 5 or len(other["text"]) <= 5
+                )
+
+                if same_row and close and gdt_like:
+                    group.append(other)
+                    used.add(j)
+                    x1 = max(p[0] for p in other['bbox'])  # advance right edge
+                    y1 = np.mean([sum(p[1] for p in g['bbox']) / 4 for g in group])  # update avg row center
+
+            if len(group) > 1:
+                # Sort group strictly left-to-right before joining text
+                group_sorted = sorted(group, key=lambda g: min(p[0] for p in g['bbox']))
+                merged_text = " ".join(g['text'] for g in group_sorted)
+
+                xs = [p[0] for g in group for p in g['bbox']]
+                ys = [p[1] for g in group for p in g['bbox']]
+                new_bbox = [
+                    [min(xs), min(ys)], [max(xs), min(ys)],
+                    [max(xs), max(ys)], [min(xs), max(ys)]
+                ]
+
+                merged.append({
+                    "text": merged_text,
+                    "bbox": new_bbox,
+                    "confidence": min(g['confidence'] for g in group)
+                })
+            else:
+                merged.append(item)
+
+        return merged
 
     def cleanup_items(self, items):
         """Removes items that are likely noise/garbage."""

@@ -17,7 +17,7 @@ class Visualizer:
         idx = start_id
 
         for item in text_items:
-            # ── Skip datum bubbles — they are reference markers, not annotations ──
+            # Skip datum bubbles — they are reference markers, not annotations
             if item.get('type') == 'DATUM_BUBBLE':
                 continue
 
