@@ -158,6 +158,10 @@ class TextExtractor:
         if re.search(r'[ØR]\s*\d', t):
             return "DIMENSION"
 
+        # 4c. MIXED GD&T FRAME — e.g. "3.4 X Y", "6.8 UZ Z", "5.4 XY Z"
+        if re.match(r'^\d+(\.\d+)?\s+[A-Z]{1,3}(\s+[A-Z]{1,3})*$', t):
+            return "GDT"
+
         # 5. NOTE — whole-word keyword match against functional engineering terms
         #    Uses word extraction to avoid substring false-positives
         #    (e.g. "EXAMPLE" must not match keyword "MAX")
@@ -463,11 +467,31 @@ class TextExtractor:
                 same_row = abs(y1 - y2) < y_thresh
                 close = 0 < (x2 - x1) < x_gap
 
-                # Semantic guard: only merge if tokens look like GD&T parts
+                # Semantic guard — BOTH tokens must look like GD&T parts,
+                # AND at least one must be a frame seed (numeric or contains brackets).
+                # This prevents pure-letter pairs like Z+X from merging.
+                def _looks_gdt_token(t):
+                    t = t.strip()
+                    if "|" in t or "(" in t:
+                        return True
+                    if re.match(r'^[A-Z]{1,3}$', t):   # X Y Z UZ etc.
+                        return True
+                    if re.match(r'^\d+(\.\d+)?$', t):  # numeric value only
+                        return True
+                    return False
+
+                def _looks_frame_seed(t):
+                    """True if token can START or ANCHOR a GD&T frame (not just a label)."""
+                    return (
+                        "|" in t or
+                        "(" in t or
+                        bool(re.match(r'^\d+(\.\d+)?$', t.strip()))
+                    )
+
                 gdt_like = (
-                    "(" in item["text"] or "(" in other["text"] or
-                    "|" in item["text"] or "|" in other["text"] or
-                    len(item["text"]) <= 5 or len(other["text"]) <= 5
+                    _looks_gdt_token(item["text"]) and
+                    _looks_gdt_token(other["text"]) and
+                    (_looks_frame_seed(item["text"]) or _looks_frame_seed(other["text"]))
                 )
 
                 if same_row and close and gdt_like:
@@ -666,7 +690,7 @@ class TextExtractor:
 # ============================================================================
 class FullPageRotationDetector:
     """Detects vertical text by rotating the entire image 90° CW,
-    running EasyOCR, and mapping bounding boxes back to original coordinates."""
+    running PaddleOCR, and mapping bounding boxes back to original coordinates."""
 
     def __init__(self, reader):
         self.reader = reader
@@ -689,7 +713,8 @@ class FullPageRotationDetector:
                 if conf < 0.2:
                     continue
                 clean_text = text.strip()
-                if not re.search(r'\d', clean_text):
+                # Fix B: allow letter-only tokens (X, Z, UZ, A…) — they are valid GD&T labels
+                if not re.search(r'[\dA-Za-z]', clean_text):
                     continue
                 if len(clean_text) < 3 or len(clean_text) > 15:
                     continue
