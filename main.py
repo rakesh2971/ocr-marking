@@ -265,6 +265,13 @@ def main():
         # ── 4.9. (PaddleOCR-native: dimension+tolerance stitcher removed) ──────
         # PaddleOCR already returns grouped blocks; stitching is no longer needed.
 
+        # ── 4.10. Classify any items that don't yet have a type ─────────────────
+        # Items from box_detector, FullPageRotationDetector and the 90°CW pass
+        # are appended directly to valid_items without a 'type' key.
+        for item in valid_items:
+            if 'type' not in item:
+                item['type'] = extractor.classify_token(item['text'])
+
         # ── 5. Group by drawing views + sort in reading order ─────────────────
         print("Grouping annotations by drawing views...")
         cluster_info, _ = clusterer.get_clusters(image, valid_items, exclusion_items=excluded_items)
@@ -296,12 +303,16 @@ def main():
 
     # ── 8. Save CSV (TPEM Technical Review Sheet format) ────────────────────
     # S.No. is per-page (cluster-wise); Page column identifies the sheet.
+    # Only export DIMENSION, GDT, NOTE — skip DATUM_BUBBLE and OTHER.
+    _EXPORT_TYPES = {"DIMENSION", "GDT", "NOTE"}
     print(f"Saving mapping to {args.output_csv}...")
     with open(args.output_csv, 'w', newline='', encoding='utf-8-sig') as csvfile:
         fieldnames = ['Page', 'S.No.', 'Parameters Critical to fitment & Function']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for row in all_mappings:
+            if row.get('type') not in _EXPORT_TYPES:
+                continue
             writer.writerow({
                 'Page': row['page'],
                 'S.No.': row['id'],

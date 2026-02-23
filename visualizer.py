@@ -8,60 +8,52 @@ class Visualizer:
 
     def draw_annotations(self, image, text_items, start_id=1):
         """
-        Draws red circles and numbers around the valid text items.
-        Returns the annotated image and the list of (number, description) tuples.
+        Draws red rectangles and sequential numbers around valid text items.
+        Skips DATUM_BUBBLE items entirely (no box, no number, no counter increment).
+        Returns the annotated image and the list of mapping dicts.
         """
         annotated_image = image.copy()
         mappings = []
-        
-        
-        # Helper to get numeric sort key if needed, but we'll specific sequential ID
-        # For now, just iterate and assign 1, 2, 3...
-        
-        for idx, item in enumerate(text_items, start=start_id):
+        idx = start_id
+
+        for item in text_items:
+            # ── Skip datum bubbles — they are reference markers, not annotations ──
+            if item.get('type') == 'DATUM_BUBBLE':
+                continue
+
             bbox = item['bbox']
             text = item['text']
-            
-            # Calculate center and radius for drawing the framing circle
-            # bbox is [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-            # Cast to int to ensure OpenCV compatibility
+
             x_min = int(min([p[0] for p in bbox]))
             x_max = int(max([p[0] for p in bbox]))
             y_min = int(min([p[1] for p in bbox]))
             y_max = int(max([p[1] for p in bbox]))
-            
-            # Draw Red Rectangle (Box)
-            # Image is RGB from PyMuPDF, so Red is (255, 0, 0)
+
+            # Draw Red Rectangle
             cv2.rectangle(annotated_image, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
 
-            # Draw Number Circle
-            # Attach it to the top-left corner
+            # Draw Number Circle at top-left
             circle_radius = 15
             circle_center = (x_min, y_min)
-            
-            # Draw filled red circle for the number background
             cv2.circle(annotated_image, circle_center, circle_radius, (255, 0, 0), -1)
-            
-            # Text properties
+
             label = str(idx)
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.5
             thickness = 1
-            
-            # Calculate text size to center it
             (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
             text_x = circle_center[0] - int(text_w / 2)
-            text_y = circle_center[1] + int(text_h / 2) # Adjust for baseline
-            
-            # Draw White Number
-            cv2.putText(annotated_image, label, (text_x, text_y), 
+            text_y = circle_center[1] + int(text_h / 2)
+            cv2.putText(annotated_image, label, (text_x, text_y),
                         font, font_scale, (255, 255, 255), thickness)
-            
+
             mappings.append({
                 'id': idx,
-                'description': text
+                'description': text,
+                'type': item.get('type', 'OTHER')
             })
-            
+            idx += 1
+
         return annotated_image, mappings
 
     def draw_debug_circles(self, image, circles):

@@ -137,22 +137,30 @@ class TextExtractor:
 
 
     def classify_token(self, text):
-        text = text.strip()
-        if re.match(r'^\d+$', text):
-            return "INTEGER"
-        if re.match(r'^\.\d+$', text):
-            return "DECIMAL_FRAGMENT"
-        if re.match(r'^\d+\.$', text):
-            return "DECIMAL_PREFIX"
-        if re.match(r'^\d+\.\d+$', text):
-            return "FULL_DECIMAL"
-        if re.match(r'^[±\+\-]?\d+(\.\d+)?$', text):
-            return "TOLERANCE"
-        if re.match(r'^[A-Z]$', text):
-            return "DATUM"
-        if 'Ø' in text or 'ø' in text:
-            return "DIAMETER"
-        return "TEXT"
+        t = text.strip()
+
+        # DATUM BUBBLE — single letter + digit, with optional surrounding brackets/spaces
+        # Covers: A1, (A1), [A1], " A1 "
+        if re.match(r'^[\(\[\s]*[A-Z]\d+[\)\]\s]*$', t):
+            return "DATUM_BUBBLE"
+
+        # GD&T FRAME — contains pipe separators or parenthesised datum refs
+        if "|" in t or re.search(r'\(.*\)', t):
+            return "GDT"
+
+        # PURE NUMERIC DIMENSION — integer or decimal, optional leading ±/+/-
+        if re.match(r'^[±\+\-]?\d+(\.\d+)?$', t):
+            return "DIMENSION"
+
+        # DIAMETER / RADIUS PREFIX DIMENSION
+        if re.search(r'[ØR]\s*\d', t):
+            return "DIMENSION"
+
+        # NOTE — contains 2+ letters AND no digits (avoids misclassifying "57.7 A B C")
+        if re.search(r'[A-Za-z]{2,}', t) and not re.search(r'\d', t):
+            return "NOTE"
+
+        return "OTHER"
 
     def apply_decimal_stitcher(self, items):
         """
