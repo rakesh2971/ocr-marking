@@ -29,6 +29,7 @@ from filter import AnnotationFilter
 from visualizer import Visualizer
 from clustering import MorphologicalClusterer
 from box_detector import BoxCharacterDetector
+from vector_extractor import VectorExtractor, is_vector_page
 
 
 def main():
@@ -47,16 +48,31 @@ def main():
     # Initialize components
     processor = DocumentProcessor()
     extractor = TextExtractor()
+    vec_extractor = VectorExtractor()
     annot_filter = AnnotationFilter()
     visualizer = Visualizer()
     clusterer = MorphologicalClusterer()
 
-    # Initialise EasyOCR once for the targeted fallback pass
-    import easyocr as _easyocr
-    from fallback_ocr import find_missing_zones, run_fallback_ocr_on_zones
-    easy_reader = _easyocr.Reader(['en'], gpu=False, verbose=False)
-
     print(f"Processing {args.input}...")
+
+    # Open the fitz.Document ONCE — reused by the per-page vector path
+    # (avoids re-opening the file for every page)
+    fitz_doc = processor.open_doc(args.input)
+
+    # Pre-scan all pages to decide if EasyOCR is needed at all.
+    # EasyOCR is heavy (~2 GB model); skip loading it for fully-vector PDFs.
+    from fallback_ocr import find_missing_zones, run_fallback_ocr_on_zones
+    _needs_ocr = any(
+        not is_vector_page(fitz_doc[i])
+        for i in range(len(fitz_doc))
+    )
+    if _needs_ocr:
+        import easyocr as _easyocr
+        easy_reader = _easyocr.Reader(['en'], gpu=False, verbose=False)
+        print("EasyOCR initialised (raster pages detected).")
+    else:
+        easy_reader = None
+        print("All pages are vector — EasyOCR skipped.")
 
     images = processor.pdf_to_images(args.input, zoom=args.zoom)
     print(f"pdf_to_images: Extracted {len(images)} pages.")
@@ -69,13 +85,22 @@ def main():
         page_counter = 1
         print(f"--- Processing Page {page_idx + 1} ---")
 
-        # ── 1. Extract text with custom thresholds ──────────────────────────
-        # Uses x_threshold=40 (tighter than default 80) to prevent GD&T frames
-        # merging with adjacent dimension values.
-        # Applies decimal stitcher + GD&T stitcher internally.
-        print("Extracting text with custom thresholds...")
-        raw_text_items = extractor.extract_text_custom(image, x_threshold=40)
-        print(f"Found {len(raw_text_items)} text items (after custom filtering).")
+        # ── 1. Extract text — vector fast path OR OCR path ──────────────────
+        fitz_page = fitz_doc[page_idx]
+        if is_vector_page(fitz_page):
+            # ── VECTOR PATH: read glyph stream directly from the PDF ─────────
+            # No OCR needed; coordinates are scaled by zoom to match the image.
+            print("[vector] Extracting text from PDF glyph stream...")
+            raw_text_items = vec_extractor.extract_page_items(fitz_page, zoom=args.zoom)
+            raw_text_items = vec_extractor.filter_items(raw_text_items, extractor)
+            print(f"[vector] Found {len(raw_text_items)} items from glyph stream.")
+        else:
+            # ── RASTER / SCANNED PATH: PaddleOCR + EasyOCR fallback ──────────
+            # Uses x_threshold=40 (tighter than default 80) to prevent GD&T frames
+            # merging with adjacent dimension values.
+            print("[raster] Extracting text via PaddleOCR...")
+            raw_text_items = extractor.extract_text_custom(image, x_threshold=40)
+            print(f"[raster] Found {len(raw_text_items)} text items.")
 
         # ── 2. Detect exclusion zones (datum circles) ───────────────────────
         print("Detecting exclusion zones (Datums)...")
@@ -151,7 +176,8 @@ def main():
             exclusion_items=excluded_items
         )
         print(f"  - Found {len(boxed_chars)} new boxed characters.")
-        valid_items = valid_items + boxed_chars
+        boxed_chars_valid, _ = annot_filter.filter_by_circles(boxed_chars, circles)
+        valid_items = valid_items + boxed_chars_valid
         
         # Also detect GD&T feature control frames (multi-compartment boxes like ⊕ Ø0.5 A B C)
         gdt_frames = box_detector.detect_gdt_frames(
@@ -160,7 +186,8 @@ def main():
             exclusion_items=excluded_items
         )
         print(f"  - Found {len(gdt_frames)} new GD&T frames.")
-        valid_items = valid_items + gdt_frames
+        gdt_frames_valid, _ = annot_filter.filter_by_circles(gdt_frames, circles)
+        valid_items = valid_items + gdt_frames_valid
         print(f"Total valid items after box detection: {len(valid_items)}")
 
         # ── 4.5. Vertical text pass (90°CW full-page rotation) ──────────────
@@ -221,7 +248,8 @@ def main():
                 valid_items.remove(h_item)
 
         print(f"  - Found {len(deduped_vert)} new vertical text items.")
-        valid_items = valid_items + deduped_vert
+        deduped_vert_valid, _ = annot_filter.filter_by_circles(deduped_vert, circles)
+        valid_items = valid_items + deduped_vert_valid
         print(f"Total valid items after vertical detection: {len(valid_items)}")
 
         # ── 4.7. 90°CW full-image pass for diagonal/leader-line annotations ─
@@ -229,7 +257,15 @@ def main():
         h_img, w_img = image.shape[:2]
         rot90 = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         rot90_gray = cv2.cvtColor(rot90, cv2.COLOR_BGR2GRAY)
-        rot90_up = cv2.resize(rot90_gray, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)
+        
+        # Prevent OpenCV SHRT_MAX error (32,767 pixels max for warpPerspective)
+        # If the image is large, 2x upscale will exceed the limit.
+        fx = fy = 2.0
+        if max(rot90_gray.shape) * 2 > 30000:
+            fx = fy = 1.0
+            print("  - Very large image detected! Disabling 2x upscale for 90°CW pass to avoid OpenCV limits.")
+            
+        rot90_up = cv2.resize(rot90_gray, None, fx=fx, fy=fy, interpolation=cv2.INTER_LANCZOS4)
         rot90_results = extractor.reader.ocr(rot90_up)
 
         if rot90_results and rot90_results[0]:
@@ -253,10 +289,10 @@ def main():
                 if not t_clean:
                     continue
                 # Inverse transform for ROTATE_90_CLOCKWISE on (H, W) image:
-                # original_x (col) = y_r / 2  (row of rotated / scale)
-                # original_y (row) = (H-1) - x_r / 2  (col of rotated / scale, flipped)
-                b_cx_r = sum(pt[0] for pt in b_r) / 4 / 2
-                b_cy_r = sum(pt[1] for pt in b_r) / 4 / 2
+                # original_x (col) = y_r / fx  (row of rotated / scale)
+                # original_y (row) = (H-1) - x_r / fy  (col of rotated / scale, flipped)
+                b_cx_r = sum(pt[0] for pt in b_r) / 4 / fx
+                b_cy_r = sum(pt[1] for pt in b_r) / 4 / fy
                 ax = int(b_cy_r)
                 ay = int((h_img - 1) - b_cx_r)
                 sz_r = 45
@@ -327,9 +363,10 @@ def main():
         print(f"Views detected: {len(cluster_info)}")
 
         # ── 5.5. Targeted fallback OCR on under-populated view clusters ────────────
-        # Only triggers for clusters with very few DIMENSION/GDT tokens relative to view area.
-        # Runs EasyOCR only on crop zones where dimension lines have no nearby text.
-        for vi, min_x_v, centroid_y_v, cluster_items in cluster_info:
+        # Only runs on RASTER pages (easy_reader is None for fully-vector PDFs).
+        # Triggers only for clusters with very few DIMENSION/GDT tokens.
+        _page_is_vector = is_vector_page(fitz_doc[page_idx])
+        for vi, min_x_v, centroid_y_v, cluster_items in ([] if _page_is_vector or easy_reader is None else cluster_info):
             numeric_count = sum(
                 1 for it in cluster_items
                 if it.get('type') in {'DIMENSION', 'GDT'}

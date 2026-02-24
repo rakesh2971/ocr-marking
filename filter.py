@@ -9,32 +9,92 @@ class AnnotationFilter:
         pass
 
     def detect_black_circles(self, image):
-        """Detects black datum circles in the image. Returns list of (x, y, r)."""
+        """Detects black datum circles in the image using Hough transform and Contours. Returns list of (x, y, r)."""
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
-        gray = cv2.medianBlur(gray, 5)
-        circles = cv2.HoughCircles(
-            gray, cv2.HOUGH_GRADIENT, dp=1, minDist=20,
+            
+        circles_found = []
+            
+        # 1. HoughCircles Pass (best for perfect raster circles)
+        blurred = cv2.medianBlur(gray, 5)
+        hf_circles = cv2.HoughCircles(
+            blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=20,
             param1=50, param2=30, minRadius=10, maxRadius=40
         )
-        detected_circles = []
-        if circles is not None:
-            detected_circles = np.uint16(np.around(circles))
-            detected_circles = detected_circles[0, :]
-        return detected_circles
+        if hf_circles is not None:
+            for c in hf_circles[0]:
+                circles_found.append((c[0], c[1], c[2]))
+                
+        # 2. Contours Pass (catches ellipses and polylines from vector PDFs)
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for c in contours:
+            area = cv2.contourArea(c)
+            # 300px area is roughly r=10, 20000px area is roughly r=80
+            if 300 < area < 20000:
+                peri = cv2.arcLength(c, True)
+                if peri == 0: continue
+                
+                circularity = 4 * np.pi * (area / (peri * peri))
+                x, y, w, h = cv2.boundingRect(c)
+                
+                # Protect against divide by zero
+                if h == 0: continue
+                aspect = float(w) / h
+                
+                # Permissive circularity for ellipses (aspect up to 1.4)
+                if 0.6 < aspect < 1.4 and circularity > 0.4:
+                    r = max(w, h) / 2.0
+                    if r > 10:
+                        cx = x + w / 2.0
+                        cy = y + h / 2.0
+                        circles_found.append((cx, cy, r))
+                        
+        # 3. Deduplicate
+        deduped = []
+        for cx, cy, cr in circles_found:
+            is_dup = False
+            for dx, dy, dr in deduped:
+                if ((cx - dx)**2 + (cy - dy)**2)**0.5 < 15:
+                    is_dup = True
+                    # Keep the larger radius to be safe when excluding text
+                    if cr > dr:
+                        deduped.remove((dx, dy, dr))
+                        deduped.append((cx, cy, cr))
+                    break
+            if not is_dup:
+                deduped.append((cx, cy, cr))
+                
+        return deduped
 
     def is_inside_circle(self, bbox, circles):
-        """Returns True if the bbox centre lies inside any circle."""
+        """Returns True if the bbox centre or its corners lie inside any circle."""
         x_coords = [p[0] for p in bbox]
         y_coords = [p[1] for p in bbox]
         center_x = sum(x_coords) / 4
         center_y = sum(y_coords) / 4
+        
         for (cx, cy, r) in circles:
-            dist = np.sqrt((center_x - cx) ** 2 + (center_y - cy) ** 2)
-            if dist < r:
+            dist_center = np.sqrt((center_x - cx) ** 2 + (center_y - cy) ** 2)
+            # Standard check: center is inside the circle
+            if dist_center < r:
                 return True
+                
+            # Fallback for vector text: vector bboxes are extremely tight and their 
+            # geometric center might be offset. Check if the entire box is 
+            # roughly contained within the circle's expanded radius.
+            expanded_r = r * 1.3
+            corners_inside = 0
+            for px, py in zip(x_coords, y_coords):
+                if np.sqrt((px - cx)**2 + (py - cy)**2) < expanded_r:
+                    corners_inside += 1
+                    
+            if corners_inside >= 3: # If 3 or 4 corners are inside, it's inside
+                return True
+                
         return False
 
     def filter_by_circles(self, text_items, circles):

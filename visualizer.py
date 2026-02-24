@@ -80,25 +80,33 @@ class Visualizer:
                         cy - circle_radius < 0 or cy + circle_radius >= img_h):
                         continue
                         
-                    # Check collision with existing balloons
+                    # Check collision with existing balloons (vectorized for speed)
                     collision = False
-                    for (px, py) in self._placed_balloons:
-                        # Distance between centers must be > 2 * radius + buffer
-                        if np.sqrt((cx - px)**2 + (cy - py)**2) < (circle_radius * 2 + 10):
-                            collision = True
-                            break
-                    if collision:
+                    if len(self._placed_balloons) > 0:
+                        pts = np.array(self._placed_balloons)
+                        dist_sq = (pts[:, 0] - cx)**2 + (pts[:, 1] - cy)**2
+                        min_dist_allowed_sq = (circle_radius * 2 + 10)**2
+                        if np.any(dist_sq < min_dist_allowed_sq):
+                            continue
+                            
+                    # Evaluate underlying image pixels for "emptiness" (lack of black lines)
+                    y1 = max(0, cy - circle_radius - 5)
+                    y2 = min(img_h, cy + circle_radius + 5)
+                    x1 = max(0, cx - circle_radius - 5)
+                    x2 = min(img_w, cx + circle_radius + 5)
+                    
+                    if y2 <= y1 or x2 <= x1:
                         continue
                         
-                    # Evaluate underlying image pixels for "emptiness" (lack of black lines)
-                    # Create a mask for the proposed circle area
-                    y_idx, x_idx = np.ogrid[:img_h, :img_w]
-                    mask = ((x_idx - cx)**2 + (y_idx - cy)**2 <= (circle_radius + 5)**2)
+                    roi_pixels = gray_image[y1:y2, x1:x2]
+                    roi_h, roi_w = roi_pixels.shape
+                    
+                    y_idx, x_idx = np.ogrid[:roi_h, :roi_w]
+                    local_cy, local_cx = cy - y1, cx - x1
+                    mask = ((x_idx - local_cx)**2 + (y_idx - local_cy)**2 <= (circle_radius + 5)**2)
                     
                     # Count "dark" pixels (indicating drawing lines or text)
-                    # Threshold for "dark" is e.g. < 200 out of 255
-                    roi_pixels = gray_image[mask]
-                    dark_pixels = np.sum(roi_pixels < 200)
+                    dark_pixels = np.sum(roi_pixels[mask] < 200)
                     
                     if dark_pixels < lowest_dark_pixels:
                         lowest_dark_pixels = dark_pixels

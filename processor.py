@@ -9,6 +9,14 @@ class DocumentProcessor:
     def __init__(self):
         pass
 
+    def open_doc(self, pdf_path):
+        """
+        Return the raw fitz.Document for the given PDF.
+        Used by the vector path so the document is opened once and reused
+        across all pages without re-opening the file per page.
+        """
+        return fitz.open(pdf_path)
+
     def pdf_to_images(self, pdf_path, zoom=2.0):
         """
         Converts a PDF to a list of images (numpy arrays for OpenCV).
