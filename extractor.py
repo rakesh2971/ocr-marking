@@ -84,6 +84,10 @@ class TextExtractor:
                     text = self.clean_text_content(text)
                     # Step 3: repair split decimals within a single token
                     text = self.repair_numeric_strings(text)
+                    # Step 3.5: repair merged/garbled tokens; None = drop this token
+                    text = self.repair_merged_token(text)
+                    if text is None:
+                        continue
                     raw_items.append({'bbox': bbox, 'text': text, 'confidence': prob})
 
         # Step 4: remove noise/garbage tokens
@@ -91,8 +95,16 @@ class TextExtractor:
 
         # Step 4.5: Reconstruct fragmented GD&T rows (horizontally split by OCR spacing)
         merged_items = self.merge_gdt_rows(cleaned_items, y_thresh=15, x_gap=45)
+        post_merged = []
         for item in merged_items:
             item["text"] = self.repair_numeric_strings(item["text"])
+            # Second pass of repair_merged_token to catch tokens re-fused by merge_gdt_rows
+            repaired = self.repair_merged_token(item["text"])
+            if repaired is None:
+                continue          # drop pure-noise merged tokens
+            item["text"] = repaired
+            post_merged.append(item)
+        merged_items = post_merged
 
         # Step 5: classify each token type for downstream logic
         for item in merged_items:
@@ -132,6 +144,80 @@ class TextExtractor:
             return re.sub(r'\s*,\s*', '.', t)
 
         return text
+
+
+    def repair_merged_token(self, text):
+        """
+        Post-processes a single OCR token to fix common merge/noise problems.
+        Returns:
+          - A repaired string  (keep this token, possibly cleaned)
+          - None              (caller should drop this token entirely)
+
+        Repair order:
+          1. S0/S00 → ⌀  (OCR misread of diameter symbol)
+          2a. Decimal + Datum fused split:  0.5ABC → 0.5 ABC
+          2b. Fused double-decimal split:   2.720.5 → 2.72   (keep first only)
+          3.  Pure-noise gate: drop tokens with no recognisable engineering sub-pattern
+        """
+        t = text.strip()
+        if not t:
+            return None
+
+        # ── 1. Diameter-symbol OCR repair ────────────────────────────────────
+        # PaddleOCR sometimes reads ⌀ as 'S0' or 'So'
+        # e.g. "S01.0x" → "⌀1.0x",  "S00.5AB" → "⌀0.5 AB"
+        t = re.sub(r'^S0{1,2}(\d)', r'⌀\1', t)
+        t = re.sub(r'^[Ss][Oo0](\d)', r'⌀\1', t)
+
+        # ── 2a. Decimal + Datum fused split ──────────────────────────────────
+        # Pattern: 0.5ABC → 0.5 ABC   (number immediately followed by datum letters)
+        datum_fused = re.match(r'^([⌀ØøÔ]?[\d]+\.\d+)([A-Z]{1,3})$', t)
+        if datum_fused:
+            num_part  = datum_fused.group(1)
+            ltr_part  = datum_fused.group(2)
+            t = f"{num_part} {ltr_part}"
+
+        # ── 2b. Fused double-decimal split ───────────────────────────────────
+        # Pattern: two decimal numbers jammed together, e.g. "2.720.5", "57.70.07"
+        # Strategy: keep only the FIRST decimal; the second is usually captured
+        # separately by PaddleOCR in its own bounding box.
+        #
+        # Engineering tolerances almost always start with "0." (e.g. ±0.5, 0.07).
+        # Use non-greedy match + lookahead (?=0\.\d) to find the exact split point
+        # without consuming the leading digit of the second number.
+        fused = re.match(
+            r'^([SR⌀ØøÔ±]?\d+\.\d+?)(?=0\.\d)',  # first decimal, lookahead: 0.x ahead
+            t
+        )
+        if fused:
+            first   = fused.group(1)
+            dropped = t[len(first):]
+            print(f"  [repair_merged] split '{t}' → kept '{first}' (dropped '{dropped}')")
+            t = first
+
+        # ── 3. Pure-noise gate ───────────────────────────────────────────────
+        # After repairs above, if the token still matches NONE of the patterns
+        # below it is considered OCR noise and is dropped (return None).
+        _GOOD = [
+            re.compile(r'[⌀ØøÔ]'),                          # diameter/GDT prefix
+            re.compile(r'^[±+-]?\d+\.\d+'),                  # decimal dimension  e.g. 2.72
+            re.compile(r'^[±+-]?\d+$'),                      # integer dimension  e.g. 12
+            re.compile(r'[⊕⊥\|○◇∠]'),                       # GDT control symbols
+            re.compile(r'^[A-Z]{1,3}$'),                     # datum label        e.g. AB
+            re.compile(r'\d+[xX]\d*'),                       # count/repeat       e.g. 4X
+            re.compile(r'\d+:\d+'),                          # ratio              e.g. 1:2
+            re.compile(r'\(\d+\.?\d*\)'),                    # parenthesised tol  e.g. (0.3)
+            re.compile(r'^[S]?R\d+\.?\d*'),                  # radius             e.g. R5, SR22.65
+            re.compile(r'^[A-Z]\d+$'),                       # datum+number ref   e.g. A1
+            re.compile(r'^\d+\.?\d*\s+[A-Z]{1,3}'),          # dim + datum string e.g. 3.4 X
+            re.compile(r'[A-Z]{2,}'),                        # multi-char text note
+            re.compile(r'\d{2,}'),                           # 2+ digit number fragment
+        ]
+        if not any(p.search(t) for p in _GOOD):
+            print(f"  [repair_merged] noise drop: '{t}' (original: '{text}')")
+            return None
+
+        return t
 
 
     def classify_token(self, text):

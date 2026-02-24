@@ -167,6 +167,15 @@ def main():
         print("Detecting vertical text via full-page rotation...")
         vert_detector = FullPageRotationDetector(extractor.reader)
         vert_items = vert_detector.detect_vertical_text(image)
+        # Apply the same token repair as extract_text_custom (catches e.g. 57.70.07 → 57.7)
+        repaired_vert = []
+        for v_item in vert_items:
+            repaired = extractor.repair_merged_token(v_item['text'])
+            if repaired is None:
+                continue
+            v_item['text'] = repaired
+            repaired_vert.append(v_item)
+        vert_items = repaired_vert
 
         deduped_vert = []
         horizontal_to_remove = []
@@ -229,6 +238,11 @@ def main():
                 if p_r < 0.35 or not t_r.strip():
                     continue
                 t_clean = extractor.clean_text_content(t_r.strip())
+                t_clean = extractor.repair_numeric_strings(t_clean)
+                # Repair merged/garbled tokens (e.g. 57.70.07 → 57.7)
+                t_clean = extractor.repair_merged_token(t_clean)
+                if t_clean is None:
+                    continue
                 if not re.search(r'\d+[.,]\d+', t_clean) or len(t_clean) > 12:
                     continue
                 if sum(c.isdigit() for c in t_clean) < 2:
