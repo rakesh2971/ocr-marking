@@ -4,6 +4,8 @@ import csv
 import re
 import cv2
 import numpy as np
+import fitz
+
 # Force IPv4 resolution to prevent BCEBOS download failures (IPv6 not always routable on Windows)
 import socket as _socket
 _orig_getaddrinfo = _socket.getaddrinfo
@@ -32,9 +34,88 @@ from box_detector import BoxCharacterDetector
 from vector_extractor import VectorExtractor, is_vector_page
 
 
+def _dedup_vertical_items(vert_items, valid_items, image_shape):
+    """
+    For each vertical item, decide if it duplicates an existing horizontal item.
+    Returns (deduped_vert, items_to_remove_from_horizontal).
+
+    Fix: the previous inline loop used `continue` after appending to
+    horizontal_to_remove, which meant `is_dup` was never set for tall boxes,
+    so the vertical item was always added even when it spatially overlapped.
+    """
+    h_img, w_img = image_shape[:2]
+    deduped_vert = []
+    horizontal_to_remove = []
+
+    from box_detector import _build_spatial_index, _get_nearby
+    spatial_index = _build_spatial_index(valid_items, cell_size=200)
+
+    for v_item in vert_items:
+        v_bbox = v_item['bbox']
+        v_x_min = min(p[0] for p in v_bbox)
+        v_x_max = max(p[0] for p in v_bbox)
+        v_y_min = min(p[1] for p in v_bbox)
+        v_y_max = max(p[1] for p in v_bbox)
+
+        # Skip items in the notes/title block (right-hand side)
+        v_cx = (v_x_min + v_x_max) / 2
+        v_cy = (v_y_min + v_y_max) / 2
+        if (v_cx > w_img * 0.70 and v_cy > h_img * 0.80) or \
+           (v_cx > w_img * 0.72 and v_cy < h_img * 0.85):
+            continue
+
+        overlapping_h_item = None
+        nearby_h_items = _get_nearby(spatial_index, v_cx, v_cy, cell_size=200)
+        
+        for h_item in nearby_h_items:
+            h_bbox = h_item['bbox']
+            h_x_min = min(p[0] for p in h_bbox)
+            h_x_max = max(p[0] for p in h_bbox)
+            h_y_min = min(p[1] for p in h_bbox)
+            h_y_max = max(p[1] for p in h_bbox)
+
+            no_overlap = (v_x_max < h_x_min - 5 or v_x_min > h_x_max + 5 or
+                          v_y_max < h_y_min - 5 or v_y_min > h_y_max + 5)
+            if no_overlap:
+                continue
+
+            overlapping_h_item = h_item
+            break
+
+
+        if overlapping_h_item is None:
+            # No overlap — vertical item is genuinely new
+            deduped_vert.append(v_item)
+        else:
+            h_bbox = overlapping_h_item['bbox']
+            h_w = max(p[0] for p in h_bbox) - min(p[0] for p in h_bbox)
+            h_h = max(p[1] for p in h_bbox) - min(p[1] for p in h_bbox)
+            h_text = overlapping_h_item['text'].strip()
+            alnum_count = sum(c.isalnum() for c in h_text)
+
+            # Prefer vertical item if the horizontal item is:
+            # - tall relative to its width (likely a mis-read vertical line), OR
+            # - very short alphanumeric (likely a fragment / noise)
+            h_is_weak = (h_h > h_w * 1.2) or (alnum_count < 3 and len(h_text) <= 4)
+
+            if h_is_weak:
+                horizontal_to_remove.append(overlapping_h_item)
+                deduped_vert.append(v_item)
+            # else: horizontal item is strong — keep it, discard vertical
+
+    return deduped_vert, horizontal_to_remove
+
+
+def _apply_horizontal_removals(valid_items, horizontal_to_remove):
+    """Remove items by identity (not value equality) to avoid dropping wrong items
+    when multiple annotations share the same text and coordinates."""
+    remove_ids = {id(it) for it in horizontal_to_remove}
+    return [it for it in valid_items if id(it) not in remove_ids]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Automated Drawing Marking System")
-    parser.add_argument("--input", required=True, help="Input PDF file path")
+    parser.add_argument("--input",      required=True, help="Input PDF file path")
     parser.add_argument("--output_pdf", required=True, help="Output Annotated PDF file path")
     parser.add_argument("--output_csv", required=True, help="Output CSV file path")
     parser.add_argument("--zoom", type=float, default=2.0, help="Zoom factor (default: 2.0)")
@@ -45,436 +126,40 @@ def main():
         print(f"Error: Input file {args.input} not found.")
         return
 
-    # Initialize components
-    processor = DocumentProcessor()
-    extractor = TextExtractor()
-    vec_extractor = VectorExtractor()
-    annot_filter = AnnotationFilter()
-    visualizer = Visualizer()
-    clusterer = MorphologicalClusterer()
-
     print(f"Processing {args.input}...")
 
-    # Open the fitz.Document ONCE — reused by the per-page vector path
-    # (avoids re-opening the file for every page)
-    fitz_doc = processor.open_doc(args.input)
-
-    # Pre-scan all pages to decide if EasyOCR is needed at all.
-    # EasyOCR is heavy (~2 GB model); skip loading it for fully-vector PDFs.
-    from fallback_ocr import find_missing_zones, run_fallback_ocr_on_zones
-    _needs_ocr = any(
-        not is_vector_page(fitz_doc[i])
-        for i in range(len(fitz_doc))
-    )
-    if _needs_ocr:
-        import easyocr as _easyocr
-        easy_reader = _easyocr.Reader(['en'], gpu=False, verbose=False)
-        print("EasyOCR initialised (raster pages detected).")
-    else:
-        easy_reader = None
-        print("All pages are vector — EasyOCR skipped.")
-
-    images = processor.pdf_to_images(args.input, zoom=args.zoom)
-    print(f"pdf_to_images: Extracted {len(images)} pages.")
-
-    annotated_images = []
+    from pipeline import AnnotationPipeline
+    pipeline = AnnotationPipeline(args)
+    
+    # ── Save annotated PDF ──────────────────────────────────────────────────
+    print(f"Opening output stream for {args.output_pdf}...")
+    output_doc = fitz.open()
     all_mappings = []
-
-    for page_idx, image in enumerate(images):
-        # Numbering is per-page: each page starts from 1 (cluster-wise, not global)
-        page_counter = 1
-        print(f"--- Processing Page {page_idx + 1} ---")
-
-        # ── 1. Extract text — vector fast path OR OCR path ──────────────────
-        fitz_page = fitz_doc[page_idx]
-        if is_vector_page(fitz_page):
-            # ── VECTOR PATH: read glyph stream directly from the PDF ─────────
-            # No OCR needed; coordinates are scaled by zoom to match the image.
-            print("[vector] Extracting text from PDF glyph stream...")
-            raw_text_items = vec_extractor.extract_page_items(fitz_page, zoom=args.zoom)
-            raw_text_items = vec_extractor.filter_items(raw_text_items, extractor)
-            print(f"[vector] Found {len(raw_text_items)} items from glyph stream.")
-        else:
-            # ── RASTER / SCANNED PATH: PaddleOCR + EasyOCR fallback ──────────
-            # Uses x_threshold=40 (tighter than default 80) to prevent GD&T frames
-            # merging with adjacent dimension values.
-            print("[raster] Extracting text via PaddleOCR...")
-            raw_text_items = extractor.extract_text_custom(image, x_threshold=40)
-            print(f"[raster] Found {len(raw_text_items)} text items.")
-
-        # ── 2. Detect exclusion zones (datum circles) ───────────────────────
-        print("Detecting exclusion zones (Datums)...")
-        circles = annot_filter.detect_black_circles(image)
-        print(f"Found {len(circles)} exclusion circles.")
-
-        # ── 3. Filter text ──────────────────────────────────────────────────
-        print("Filtering text...")
-
-        # A. Datum circles
-        valid_items_1, excluded_datums = annot_filter.filter_by_circles(raw_text_items, circles)
-        print(f"  - Removed {len(excluded_datums)} items inside datum circles.")
-
-        # B. Notes section
-        valid_items_2, excluded_notes = annot_filter.filter_notes_section(valid_items_1)
-        print(f"  - Removed {len(excluded_notes)} items from Notes section.")
-
-        # B2. Notes rescue pass: re-admit drawing items incorrectly caught by notes filter
-        rescued_notes, excluded_notes = annot_filter.rescue_from_notes_filter(
-            excluded_notes, raw_text_items
-        )
-        if rescued_notes:
-            print(f"  - RESCUED {len(rescued_notes)} drawing items from Notes filter.")
-            valid_items_2 = valid_items_2 + rescued_notes
-
-        # C. Bottom-right table
-        valid_items_3, excluded_table = annot_filter.filter_bottom_right_table(valid_items_2, image.shape)
-        print(f"  - Removed {len(excluded_table)} items from Bottom-Right Table.")
-
-        # C2. Generic GD&T low-confidence rescue
-        # NOTE: deliberately exclude excluded_table so that table data like
-        # "680.1" or "34" are not mistaken for engineering dimensions.
-        all_excluded_so_far = excluded_datums + excluded_notes
-        gdt_rescued = annot_filter.rescue_gdt_items(
-            all_excluded_so_far,
-            valid_items_3,
-            clean_text_fn=extractor.clean_text_content
-        )
-        if gdt_rescued:
-            valid_items_3 = valid_items_3 + gdt_rescued
-
-        # D. View labels
-        valid_items_4, excluded_views = annot_filter.filter_view_labels(valid_items_3)
-        print(f"  - Removed {len(excluded_views)} view label items.")
-
-        # E. Top-left sheet numbers
-        valid_items, excluded_top_left = annot_filter.filter_top_left_numbers(valid_items_4, image.shape)
-        print(f"  - Removed {len(excluded_top_left)} items from Top-Left Corner.")
-
-        excluded_items = (excluded_datums + excluded_notes + excluded_table
-                          + excluded_views + excluded_top_left)
-
-        # F. Final text-pattern cleanup: drop 8+ digit part numbers and
-        #    table header fragments that slip through spatial filters.
-        import re as _re
-        _PARTNUM = _re.compile(r'^\d{8,}$')
-        _TABLE_HEADERS = {'TABLE NO', 'ITEMPART NO', 'ITEM PART NO', 'DESCRIPTION'}
-        _pre_cleanup = len(valid_items)
-        valid_items = [
-            it for it in valid_items
-            if not _PARTNUM.match(it.get('text', '').strip())
-            and it.get('text', '').strip().upper() not in _TABLE_HEADERS
-        ]
-        print(f"  - Removed {_pre_cleanup - len(valid_items)} items by text-pattern cleanup (part numbers / table headers).")
-        print(f"Valid items: {len(valid_items)}, Total Excluded: {len(excluded_items)}")
-
-        # ── 4. Detect boxed characters ──────────────────────────────────────
-        print(f"Detecting boxed characters...")
-        box_detector = BoxCharacterDetector(extractor.reader)
-        boxed_chars = box_detector.detect_boxed_characters(
-            image,
-            existing_items=valid_items,
-            exclusion_items=excluded_items
-        )
-        print(f"  - Found {len(boxed_chars)} new boxed characters.")
-        boxed_chars_valid, _ = annot_filter.filter_by_circles(boxed_chars, circles)
-        valid_items = valid_items + boxed_chars_valid
+    
+    # Iterate over the generator, incrementally buffering and dropping RAM
+    for page_idx, ann_img, mappings in pipeline.run():
+        pipeline.processor.append_page_to_pdf(output_doc, ann_img)
+        all_mappings.extend(mappings)
+        del ann_img # explicit free
         
-        # Also detect GD&T feature control frames (multi-compartment boxes like ⊕ Ø0.5 A B C)
-        gdt_frames = box_detector.detect_gdt_frames(
-            image,
-            existing_items=valid_items,
-            exclusion_items=excluded_items
-        )
-        print(f"  - Found {len(gdt_frames)} new GD&T frames.")
-        gdt_frames_valid, _ = annot_filter.filter_by_circles(gdt_frames, circles)
-        valid_items = valid_items + gdt_frames_valid
-        print(f"Total valid items after box detection: {len(valid_items)}")
+    import tempfile
+    import shutil
+    
+    out_dir = os.path.dirname(os.path.abspath(args.output_pdf))
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.pdf', dir=out_dir)
+    os.close(tmp_fd)
 
-        # ── 4.5. Vertical text pass (90°CW full-page rotation) ──────────────
-        print("Detecting vertical text via full-page rotation...")
-        vert_detector = FullPageRotationDetector(extractor.reader)
-        vert_items = vert_detector.detect_vertical_text(image)
-        # Apply the same token repair as extract_text_custom (catches e.g. 57.70.07 → 57.7)
-        repaired_vert = []
-        for v_item in vert_items:
-            repaired = extractor.repair_merged_token(v_item['text'])
-            if repaired is None:
-                continue
-            v_item['text'] = repaired
-            repaired_vert.append(v_item)
-        vert_items = repaired_vert
+    try:
+        output_doc.save(tmp_path)
+        output_doc.close()
+        shutil.move(tmp_path, args.output_pdf)
+        print(f"Saved annotated PDF to {args.output_pdf}")
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise RuntimeError(f"Failed to save PDF to '{args.output_pdf}' (Disk full?): {e}") from e
 
-        deduped_vert = []
-        horizontal_to_remove = []
-        for v_item in vert_items:
-            v_bbox = v_item['bbox']
-            v_x_min = min(p[0] for p in v_bbox)
-            v_x_max = max(p[0] for p in v_bbox)
-            v_y_min = min(p[1] for p in v_bbox)
-            v_y_max = max(p[1] for p in v_bbox)
-            is_dup = False
-            for h_item in valid_items:
-                h_bbox = h_item['bbox']
-                h_x_min = min(p[0] for p in h_bbox)
-                h_x_max = max(p[0] for p in h_bbox)
-                h_y_min = min(p[1] for p in h_bbox)
-                h_y_max = max(p[1] for p in h_bbox)
-                if not (v_x_max < h_x_min - 5 or v_x_min > h_x_max + 5 or
-                        v_y_max < h_y_min - 5 or v_y_min > h_y_max + 5):
-                    h_w = h_x_max - h_x_min
-                    h_h = h_y_max - h_y_min
-                    if h_h > h_w * 1.2:
-                        horizontal_to_remove.append(h_item)
-                        continue
-                    h_text = h_item['text'].strip()
-                    alnum_count = sum(c.isalnum() for c in h_text)
-                    if alnum_count < 3 and len(h_text) <= 4:
-                        horizontal_to_remove.append(h_item)
-                        continue
-                    is_dup = True
-                    break
-            h_img_sz, w_img_sz = image.shape[:2]
-            v_cx = (v_x_min + v_x_max) / 2
-            v_cy = (v_y_min + v_y_max) / 2
-            if v_cx > w_img_sz * 0.70 and v_cy > h_img_sz * 0.80:
-                is_dup = True
-            if v_cx > w_img_sz * 0.72 and v_cy < h_img_sz * 0.85:
-                is_dup = True
-            if not is_dup:
-                deduped_vert.append(v_item)
-
-        for h_item in horizontal_to_remove:
-            if h_item in valid_items:
-                valid_items.remove(h_item)
-
-        print(f"  - Found {len(deduped_vert)} new vertical text items.")
-        deduped_vert_valid, _ = annot_filter.filter_by_circles(deduped_vert, circles)
-        valid_items = valid_items + deduped_vert_valid
-        print(f"Total valid items after vertical detection: {len(valid_items)}")
-
-        # ── 4.7. 90°CW full-image pass for diagonal/leader-line annotations ─
-        print("Running 90°CW full-image pass for diagonal annotations...")
-        h_img, w_img = image.shape[:2]
-        rot90 = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-        rot90_gray = cv2.cvtColor(rot90, cv2.COLOR_BGR2GRAY)
-        
-        # Prevent OpenCV SHRT_MAX error (32,767 pixels max for warpPerspective)
-        # If the image is large, 2x upscale will exceed the limit.
-        fx = fy = 2.0
-        if max(rot90_gray.shape) * 2 > 30000:
-            fx = fy = 1.0
-            print("  - Very large image detected! Disabling 2x upscale for 90°CW pass to avoid OpenCV limits.")
-            
-        rot90_up = cv2.resize(rot90_gray, None, fx=fx, fy=fy, interpolation=cv2.INTER_LANCZOS4)
-        rot90_results = extractor.reader.ocr(rot90_up)
-
-        if rot90_results and rot90_results[0]:
-            for line in rot90_results[0]:
-                b_r, (t_r, p_r) = line
-                if p_r < 0.35 or not t_r.strip():
-                    continue
-                t_clean = extractor.clean_text_content(t_r.strip())
-                t_clean = extractor.repair_numeric_strings(t_clean)
-                # Repair merged/garbled tokens (e.g. 57.70.07 → 57.7)
-                t_clean = extractor.repair_merged_token(t_clean)
-                if t_clean is None:
-                    continue
-                if not re.search(r'\d+[.,]\d+', t_clean) or len(t_clean) > 12:
-                    continue
-                if sum(c.isdigit() for c in t_clean) < 2:
-                    continue
-                if '=' in t_clean:
-                    continue
-                t_clean = t_clean.split(':')[0].strip()
-                if not t_clean:
-                    continue
-                # Inverse transform for ROTATE_90_CLOCKWISE on (H, W) image:
-                # original_x (col) = y_r / fx  (row of rotated / scale)
-                # original_y (row) = (H-1) - x_r / fy  (col of rotated / scale, flipped)
-                b_cx_r = sum(pt[0] for pt in b_r) / 4 / fx
-                b_cy_r = sum(pt[1] for pt in b_r) / 4 / fy
-                ax = int(b_cy_r)
-                ay = int((h_img - 1) - b_cx_r)
-                sz_r = 45
-                t_digits = re.sub(r'[^\d]', '', t_clean)
-                already_r = any(
-                    (
-                        abs(sum(p[0] for p in ex['bbox']) / 4 - ax) < 100 and
-                        abs(sum(p[1] for p in ex['bbox']) / 4 - ay) < 100
-                    ) or (
-                        len(ex['text'].strip()) <= 10 and
-                        re.sub(r'[^\d]', '', ex['text']) == t_digits and
-                        len(t_digits) >= 2
-                    )
-                    for ex in valid_items
-                )
-                if not already_r:
-                    new_bbox_r = [[ax - sz_r, ay - sz_r], [ax + sz_r, ay - sz_r],
-                                  [ax + sz_r, ay + sz_r], [ax - sz_r, ay + sz_r]]
-                    valid_items.append({'bbox': new_bbox_r, 'text': t_clean, 'confidence': p_r})
-                    print(f"  - 90°CW pass rescued: '{t_clean}' @ ({ax},{ay})")
-
-        # ── 4.8. GD&T singleton enforcement ─────────────────────────────────
-        # Tighten the bbox of any GD&T frame item so it forms its own cluster.
-        gdt_pattern = re.compile(
-            r'^[|\u22a5\u2016\u25cb\u25c7\u2220\u2295]?\s*\d+[.,]\d+\s*[A-Z]?\s*$'
-        )
-        for item in valid_items:
-            if gdt_pattern.match(item['text'].strip()):
-                cx_g = int(sum(p[0] for p in item['bbox']) / 4)
-                cy_g = int(sum(p[1] for p in item['bbox']) / 4)
-                hw_g = max(80, abs(item['bbox'][1][0] - item['bbox'][0][0]) // 2)
-                hh_g = max(20, abs(item['bbox'][2][1] - item['bbox'][1][1]) // 2)
-                item['bbox'] = [
-                    [cx_g - hw_g, cy_g - hh_g],
-                    [cx_g + hw_g, cy_g - hh_g],
-                    [cx_g + hw_g, cy_g + hh_g],
-                    [cx_g - hw_g, cy_g + hh_g]
-                ]
-
-        # ── 4.9. (PaddleOCR-native: dimension+tolerance stitcher removed) ──────
-        # PaddleOCR already returns grouped blocks; stitching is no longer needed.
-
-        # ── 4.10. Classify any items that don't yet have a type ─────────────────
-        # Items from box_detector, FullPageRotationDetector and the 90°CW pass
-        # are appended directly to valid_items without a 'type' key.
-        for item in valid_items:
-            if 'type' not in item:
-                item['type'] = extractor.classify_token(item['text'])
-
-        # ── 4.10b. Final universal text-pattern sweep ─────────────────────────
-        # Runs AFTER all item sources (PaddleOCR, box_detector, vertical, 90°CW).
-        # Catches items like 548232103801 added by box_detector AFTER step F.
-        import re as _re2
-        _PARTNUM2 = _re2.compile(r'^\d{8,}$')
-        _TABLE_HDR2 = {'TABLE NO', 'ITEMPART NO', 'ITEM PART NO', 'DESCRIPTION'}
-        _n_before = len(valid_items)
-        valid_items = [
-            it for it in valid_items
-            if not _PARTNUM2.match(it.get('text', '').strip())
-            and it.get('text', '').strip().upper() not in _TABLE_HDR2
-        ]
-        if _n_before != len(valid_items):
-            print(f"  - Universal sweep removed {_n_before - len(valid_items)} part-number/table items.")
-
-        # ── 5. Group by drawing views + sort in reading order ─────────────────
-        print("Grouping annotations by drawing views...")
-        cluster_info, _, view_rects_map = clusterer.get_clusters(image, valid_items, exclusion_items=excluded_items)
-        print(f"Views detected: {len(cluster_info)}")
-
-        # ── 5.5. Targeted fallback OCR on under-populated view clusters ────────────
-        # Only runs on RASTER pages (easy_reader is None for fully-vector PDFs).
-        # Triggers only for clusters with very few DIMENSION/GDT tokens.
-        _page_is_vector = is_vector_page(fitz_doc[page_idx])
-        for vi, min_x_v, centroid_y_v, cluster_items in ([] if _page_is_vector or easy_reader is None else cluster_info):
-            numeric_count = sum(
-                1 for it in cluster_items
-                if it.get('type') in {'DIMENSION', 'GDT'}
-            )
-            rect = view_rects_map.get(vi)
-            if rect is None:
-                continue
-            rx, ry, rw, rh = rect
-
-            # Skip views that overlap with the BOM/material table zone.
-            # _table_cutoff_y is set by filter_bottom_right_table.
-            _table_guard = getattr(annot_filter, '_table_cutoff_y', image.shape[0])
-            if ry + rh * 0.5 > _table_guard:
-                continue
-
-            area = rw * rh
-            density = numeric_count / max(area, 1)
-
-            # Skip healthy clusters
-            if numeric_count >= 3 and density >= 0.000002:
-                continue
-
-            # Correct colour-space conversion (image may be BGR in this pipeline)
-            view_crop = image[ry:ry + rh, rx:rx + rw]
-            if len(view_crop.shape) == 3:
-                view_gray = cv2.cvtColor(view_crop, cv2.COLOR_BGR2GRAY)
-            else:
-                view_gray = view_crop
-
-            zones = find_missing_zones(view_gray, cluster_items, rx, ry)
-            if not zones:
-                continue
-
-            new_items = run_fallback_ocr_on_zones(image, zones, easy_reader, extractor)
-            if new_items:
-                # Strip any part numbers that slipped past _is_useful_token
-                new_items = [
-                    it for it in new_items
-                    if not _PARTNUM2.match(it.get('text', '').strip())
-                ]
-
-                # ── View-label proximity guard ─────────────────────────────
-                # Fallback OCR runs after filter_view_labels, so rescued items
-                # can land next to view-title text (e.g. "6" beside SECTION VIEW A-A).
-                # Drop any rescued item whose centre is within 150 px of an
-                # already-excluded view-label centroid.
-                _VL_PROX = 150
-                _excl_vl_centres = [
-                    (sum(p[0] for p in ex['bbox']) / 4,
-                     sum(p[1] for p in ex['bbox']) / 4)
-                    for ex in excluded_views
-                ]
-                _filtered_items = []
-                for _it in new_items:
-                    _cx = sum(p[0] for p in _it['bbox']) / 4
-                    _cy = sum(p[1] for p in _it['bbox']) / 4
-                    _near = any(
-                        abs(_cx - _ex_cx) < _VL_PROX and abs(_cy - _ex_cy) < _VL_PROX
-                        for _ex_cx, _ex_cy in _excl_vl_centres
-                    )
-                    if _near:
-                        print(f"  - Fallback OCR proximity drop: '{_it['text']}' @ ({int(_cx)},{int(_cy)}) near view label")
-                    else:
-                        _filtered_items.append(_it)
-                new_items = _filtered_items
-                # ─────────────────────────────────────────────────────────
-
-                if not new_items:
-                    continue
-                cluster_items.extend(new_items)
-                # Re-sort in reading order after insertion
-                cluster_items.sort(key=lambda it: (
-                    min(p[1] for p in it['bbox']),
-                    min(p[0] for p in it['bbox'])
-                ))
-                valid_items.extend(new_items)
-                print(f"  Fallback OCR rescued {len(new_items)} item(s) in view {vi}")
-
-        # ── 6. Visualize (draw per-cluster numbering) ───────────────
-        annotated_img = image.copy()
-
-        for _, _, _, cluster_items in cluster_info:
-
-            annotated_img, page_mappings = visualizer.draw_annotations(
-                annotated_img,
-                cluster_items,
-                start_id=page_counter
-            )
-
-            for m in page_mappings:
-                m['page'] = page_idx + 1
-
-            all_mappings.extend(page_mappings)
-
-            # Advance counter only by DRAWN items (page_mappings), not all cluster_items.
-            # Using len(cluster_items) created phantom IDs for skipped items, causing gaps.
-            page_counter += len(page_mappings)
-
-        annotated_images.append(annotated_img)
-
-    # ── 7. Save annotated PDF ────────────────────────────────────────────────
-    print(f"Saving annotated PDF to {args.output_pdf}...")
-    processor.images_to_pdf(annotated_images, args.output_pdf)
-
-    # ── 8. Save CSV (TPEM Technical Review Sheet format) ────────────────────
-    # S.No. is per-page (cluster-wise); Page column identifies the sheet.
-    # Export ALL drawn items — DRAW_TYPES in visualizer already controls what's drawn,
-    # so every item here belongs to a meaningful annotation type.
+    # ── Save CSV ────────────────────────────────────────────────────────────
     print(f"Saving mapping to {args.output_csv}...")
     with open(args.output_csv, 'w', newline='', encoding='utf-8-sig') as csvfile:
         fieldnames = ['Page', 'S.No.', 'Parameters Critical to fitment & Function']

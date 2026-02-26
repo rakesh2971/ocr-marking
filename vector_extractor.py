@@ -95,10 +95,21 @@ class VectorExtractor:
         Merges horizontally adjacent text items. PyMuPDF 'words' occasionally separates
         content living in distinct boxes (like GD&T cells [0.3] [S] [U]), even when
         they're far apart horizontally within the same row.
+
+        Iterative: repeats single-pass merging until the list stabilises.
+        (Previously recursive — risked RecursionError on complex drawings.)
         """
+        while True:
+            merged = self._merge_pass(items, x_gap, y_thresh)
+            if len(merged) == len(items):
+                return merged
+            items = merged  # loop with a shorter list
+
+    def _merge_pass(self, items: list, x_gap: float, y_thresh: float) -> list:
+        """Single greedy merge pass — called repeatedly by _merge_vector_items."""
         if not items:
             return []
-            
+
         merged = []
         skip = set()
         
@@ -159,12 +170,9 @@ class VectorExtractor:
                     'type': None
                 })
             else:
+
                 merged.append(item)
-                
-        # Repeat until no more merges happen
-        if len(merged) < len(items):
-            return self._merge_vector_items(merged, x_gap, y_thresh)
-            
+
         return merged
 
     def filter_items(self, items: list, extractor) -> list:
@@ -181,24 +189,31 @@ class VectorExtractor:
         """
         result = []
         for item in items:
-            # 1. Repair/clean text (handles merged decimals, OCR-style mis-reads)
-            repaired = extractor.repair_merged_token(item['text'])
-            if repaired is None:
-                continue  # token classified as pure noise → drop
+            text = item['text']
 
-            # 2. Standard text cleanup (symbol fixes etc.)
-            cleaned = extractor.clean_text_content(repaired)
-            if not cleaned.strip():
+            # 1. Normalize spacing/symbol errors FIRST — vector PDFs often have
+            #    decimals stored as "3 . 0" (spaces around the period) which would
+            #    cause repair_merged_token to drop the token as noise.
+            text = extractor.clean_text_content(text)
+            if not text.strip():
                 continue
 
-            # 3. Numeric string repair (fused decimals inside a token)
-            cleaned = extractor.repair_numeric_strings(cleaned)
+            # 2. Repair split decimals (e.g. "3 . 0" already handled by clean,
+            #    but this catches fused tokens like "2.720.5")
+            text = extractor.repair_numeric_strings(text)
 
-            item['text'] = cleaned
+            # 3. Noise gate — drop tokens that don't match any engineering pattern.
+            #    Now runs AFTER normalization so "3.0 D R F" passes correctly.
+            repaired = extractor.repair_merged_token(text)
+            if repaired is None:
+                continue  # pure noise — drop
+
+            item['text'] = repaired
 
             # 4. Classify the token type (DIMENSION, GDT, TEXT, etc.)
-            item['type'] = extractor.classify_token(cleaned)
+            item['type'] = extractor.classify_token(repaired)
 
             result.append(item)
 
         return result
+

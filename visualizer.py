@@ -1,12 +1,19 @@
 
 import cv2
 import numpy as np
+from config import (
+    BALLOON_RADIUS,
+    BALLOON_DISTANCES,
+    BALLOON_DARK_THRESHOLD,
+    BALLOON_FONT_SCALE,
+    BALLOON_THICKNESS
+)
 
 class Visualizer:
     def __init__(self):
         pass
 
-    def draw_annotations(self, image, text_items, start_id=1):
+    def draw_annotations(self, image, text_items, start_id=1, gray_image=None):
         """
         Draws red rectangles and sequential numbers around valid text items.
         Skips DATUM_BUBBLE items entirely (no box, no number, no counter increment).
@@ -15,6 +22,7 @@ class Visualizer:
         annotated_image = image.copy()
         mappings = []
         idx = start_id
+        self._placed_balloons = []   # reset every call so page 2+ don't avoid page 1 positions
 
         for item in text_items:
             # Skip datum bubbles — they are reference markers, not annotations
@@ -33,7 +41,7 @@ class Visualizer:
             box_color = (255, 0, 0) # Red in RGB
             cv2.rectangle(annotated_image, (x_min, y_min), (x_max, y_max), box_color, 2)
 
-            circle_radius = 25
+            circle_radius = BALLOON_RADIUS
             
             # Start of the balloon line (top middle or top left of the bounding box)
             line_start_x = x_min + int((x_max - x_min) * 0.25)
@@ -58,19 +66,14 @@ class Visualizer:
                 np.pi/2           # Straight down
             ]
             
-            # Convert image to grayscale for white-space checking if needed
-            if len(image.shape) == 3:
-                gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray_image = image
+            # Use the pre-computed grayscale image for white-space checking
+            if gray_image is None:
+                gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
                 
             img_h, img_w = gray_image.shape
             
-            # Keep track of placed balloons so we don't overlap them
-            if not hasattr(self, '_placed_balloons'):
-                self._placed_balloons = []
-                
-            for dist in [50, 75, 100, 125, 150]:
+
+            for dist in BALLOON_DISTANCES:
                 for angle in angles_to_try:
                     cx = int(line_start_x + dist * np.cos(angle))
                     cy = int(line_start_y + dist * np.sin(angle))
@@ -113,7 +116,7 @@ class Visualizer:
                         best_cx, best_cy = cx, cy
                         
                     # If we find a spot that is almost entirely white, take it immediately
-                    if dark_pixels < 10:
+                    if dark_pixels < BALLOON_DARK_THRESHOLD:
                         found_clear_spot = True
                         break
                 if found_clear_spot:
@@ -137,8 +140,8 @@ class Visualizer:
             label = str(idx)
             font = cv2.FONT_HERSHEY_SIMPLEX
             # Scale font nicely within circle
-            font_scale = 1.0
-            thickness = 2
+            font_scale = BALLOON_FONT_SCALE
+            thickness = BALLOON_THICKNESS
             (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
             
             # Centering text inside circle

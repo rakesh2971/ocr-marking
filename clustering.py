@@ -19,14 +19,13 @@ class MorphologicalClusterer:
     def __init__(self):
         pass
 
-    def _get_view_regions(self, image, items, exclusion_items):
+    def _get_view_regions(self, image_gray, items, exclusion_items, notes_zone=(None, None), title_block_zone=(None, None)):
         """
         Detects major drawing parts/views by heavy morphological dilation.
+        notes_zone: (cutoff_x, cutoff_y) from filter_notes_section, or (None, None).
+        title_block_zone: (cutoff_x, cutoff_y) from filter.detect_title_block_boundary.
         """
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
+        gray = image_gray
 
         _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
         draw_ink = binary.copy()
@@ -39,9 +38,37 @@ class MorphologicalClusterer:
         draw_ink[cv2.morphologyEx(draw_ink, cv2.MORPH_OPEN, h_kern) > 0] = 0
         draw_ink[cv2.morphologyEx(draw_ink, cv2.MORPH_OPEN, v_kern) > 0] = 0
 
-        # Erase the notes section (rightmost 27%) and the title block region
-        cv2.rectangle(draw_ink, (int(w * 0.73), 0), (w, h), 0, -1)
-        cv2.rectangle(draw_ink, (int(w * 0.65), int(h * 0.8)), (w, h), 0, -1)
+        # Erase the notes / title block region using the dynamically detected boundary.
+        # Fall back to the 73% hardcoded heuristic when no header was detected.
+        notes_x, notes_y = notes_zone
+        tb_x, tb_y = title_block_zone
+        if notes_x is not None and notes_y is not None:
+            notes_x_px = int(notes_x)
+            notes_y_px = int(notes_y)
+            if tb_x is not None and tb_y is not None:
+                # Split the erase into two rectangles:
+                # 1. Notes column from its header down to title block top
+                # 2. Full width from title block top downward (already handled
+                #    by the title block erase below)
+                # This leaves the bottom-right section view area visible.
+                cv2.rectangle(draw_ink,
+                              (notes_x_px, notes_y_px),
+                              (w, int(tb_y)),
+                              0, -1)
+            else:
+                # No title block detected — erase full notes column to bottom
+                cv2.rectangle(draw_ink, (notes_x_px, notes_y_px), (w, h), 0, -1)
+        else:
+            # Fallback: rightmost 27% is assumed to be notes
+            cv2.rectangle(draw_ink, (int(w * 0.73), 0), (w, h), 0, -1)
+            
+        # Only erase title block if boundary was explicitly detected.
+        # No hardcoded fallback — on wide drawings the bottom-right contains
+        # valid section views that the old fixed cutoff was silently dropping.
+        tb_x, tb_y = title_block_zone
+        if tb_x is not None and tb_y is not None:
+            cv2.rectangle(draw_ink, (int(tb_x), int(tb_y)), (w, h), 0, -1)
+            print(f"  [clusterer] title block erased from x={int(tb_x)}, y={int(tb_y)}")
 
         # Erase all text boxes to prevent text from bridging distinct drawing views
         for item in items:
@@ -99,7 +126,7 @@ class MorphologicalClusterer:
         part_boxes.sort(key=lambda b: (b[1] // ROW_HEIGHT, b[0]))
         return part_boxes
 
-    def get_clusters(self, image, items, exclusion_items=[]):
+    def get_clusters(self, image_gray, items, exclusion_items=[], notes_zone=(None, None), title_block_zone=(None, None)):
         """
         Groups annotations by drawing view regions (layout), not by proximity.
 
@@ -107,16 +134,36 @@ class MorphologicalClusterer:
         - Assigns each annotation to its containing view, or nearest view if none contains.
         - Sorts views in reading order (Top → Bottom, Left → Right).
         - Sorts annotations within each view in reading order.
+        - notes_zone: (cutoff_x, cutoff_y) from filter_notes_section.
         - Returns (cluster_info, labeled_img) for sequential view-by-view numbering.
         """
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
+        gray = image_gray
 
         h, w = gray.shape
 
-        view_rects = self._get_view_regions(image, items, exclusion_items)
+        exclusion_items = exclusion_items or []
+        if not items:
+            return [], {}, []
+
+        valid_items = []
+        for item in items:
+            bbox = item.get('bbox', [])
+            if len(bbox) < 2:
+                print(f"  [cluster] Dropping item with malformed bbox: {item.get('text', '?')}")
+                continue
+            if len(bbox) == 2:
+                x0, y0 = bbox[0]
+                x1, y1 = bbox[1]
+                item = dict(item)
+                item['bbox'] = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+            valid_items.append(item)
+            
+        items = valid_items
+
+        view_rects = self._get_view_regions(
+            image_gray, items, exclusion_items,
+            notes_zone=notes_zone, title_block_zone=title_block_zone
+        )
         if not view_rects:
             view_rects = [(0, 0, w, h)]
 
@@ -127,13 +174,32 @@ class MorphologicalClusterer:
             cx = sum(p[0] for p in bbox) / 4
             cy = sum(p[1] for p in bbox) / 4
 
-            # Skip annotations in the notes section (rightmost 27%) entirely
-            if cx > w * 0.73:
-                continue
-                
-            # Skip title block annotations roughly
-            if cx > w * 0.65 and cy > h * 0.8:
-                continue
+            # Skip title block only if boundary was explicitly detected.
+            # Removed hardcoded 65%/80% fallback — it was dropping valid
+            # section views on wide bumper/fascia drawings.
+            tb_x, tb_y = title_block_zone
+            if tb_x is not None and tb_y is not None:
+                if cx >= tb_x and cy >= tb_y:
+                    continue
+
+            # Skip items in the notes zone if we have a dynamic boundary.
+            # Use a stricter x cutoff — only skip items clearly inside the
+            # notes column (within 50px right of the detected header x).
+            # This prevents cutting bottom-right section views that share
+            # a similar x position but are actually left of the notes column.
+            notes_x, notes_y = notes_zone
+            if notes_x is not None and notes_y is not None:
+                notes_right_edge = w  # notes run to the right edge
+                if cx >= notes_x and cy >= notes_y and cx <= notes_right_edge:
+                    # Extra guard: if title block boundary is known, only skip
+                    # if we're NOT in the valid drawing area below the notes
+                    tb_x, tb_y = title_block_zone
+                    if tb_x is None or cx >= tb_x:
+                        continue
+            else:
+                # Fallback: skip rightmost 27%
+                if cx > w * 0.73:
+                    continue
 
             best_view = None
             best_dist_sq = float('inf')

@@ -8,31 +8,77 @@ that EasyOCR's full-page scan often misses.
 import cv2
 import numpy as np
 import re
+from config import (
+    BOX_AREA_MIN, BOX_AREA_MAX, BOX_ASPECT_MIN, BOX_ASPECT_MAX,
+    BOX_FILL_RATIO, BOX_EDGE_MARGIN, BOX_ISOLATION_MARGIN,
+    BOX_OCR_UPSCALE, BOX_OCR_CONF_MIN, BOX_MAX_CHARS,
+    GDT_AREA_MIN, GDT_AREA_MAX, GDT_ASPECT_MIN, GDT_ASPECT_MAX,
+    GDT_FILL_RATIO, GDT_EDGE_MARGIN, GDT_OCR_CONF_MIN, GDT_MAX_TEXT_LEN,
+    DEDUP_OVERLAP_THRESHOLD, DEDUP_CENTER_PROXIMITY,
+    scale_area, scale_length,
+)
+
+def _build_spatial_index(items, cell_size=100):
+    """Bucket items into a grid for fast O(1) neighbour lookup."""
+    index = {}
+    for item in items:
+        # Prevent zero-division and cluster correctly
+        cx = int(sum(p[0] for p in item['bbox']) / 4 / cell_size)
+        cy = int(sum(p[1] for p in item['bbox']) / 4 / cell_size)
+        index.setdefault((cx, cy), []).append(item)
+    return index
+
+def _get_nearby(index, cx, cy, cell_size=100):
+    """Return items in the same and 8 adjacent grid cells."""
+    gx, gy = int(cx / cell_size), int(cy / cell_size)
+    nearby = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if (gx+dx, gy+dy) in index:
+                nearby.extend(index[(gx+dx, gy+dy)])
+    return nearby
 
 
 class BoxCharacterDetector:
-    def __init__(self, reader):
+    def __init__(self, reader, zoom: float = 2.0):
         """
-        Initialize with an existing EasyOCR reader instance (to avoid loading model twice).
+        Initialize with an existing PaddleOCR reader instance (to avoid
+        loading the model twice) and the zoom factor used when rasterising
+        the PDF page (default 2.0).
+
+        Args:
+            reader : PaddleOCR instance (the same one used in TextExtractor)
+            zoom   : Rasterisation zoom (used to scale pixel thresholds)
         """
+        from paddleocr import PaddleOCR
+        if not isinstance(reader, PaddleOCR):
+            raise TypeError(
+                f"BoxCharacterDetector expects a PaddleOCR reader, "
+                f"got {type(reader).__name__}. "
+                f"Pass extractor.reader from your TextExtractor instance."
+            )
         self.reader = reader
+        self.zoom = zoom
     
-    def detect_boxed_characters(self, image, existing_items=[], exclusion_items=[]):
+    def detect_boxed_characters(self, image, image_gray, existing_items=None, exclusion_items=None):
         """
         Detects isolated rectangular boxes in the drawing and OCRs their contents.
         
         Args:
             image: numpy array (the rasterized page)
+            image_gray: pre-computed grayscale image
             existing_items: items already detected by the main OCR pass (to avoid duplicates)
             exclusion_items: items in exclusion zones (to avoid detecting table cells etc.)
             
         Returns:
             new_items: list of dicts with 'bbox', 'text', 'confidence' for newly detected characters
         """
+        existing_items  = existing_items  or []
+        exclusion_items = exclusion_items or []
         h, w = image.shape[:2]
         
         # 1. Binarize
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        gray = image_gray
         _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
         
         # 2. Find contours
@@ -53,11 +99,15 @@ class BoxCharacterDetector:
             contour_area = cv2.contourArea(cnt)
             fill_ratio = contour_area / area if area > 0 else 0
             
-            # Datum boxes: roughly 30-50px squares at zoom=2.0, high fill ratio
-            if (800 < area < 4500 and 
-                0.6 < aspect < 2.8 and 
-                x > 50 and y > 50 and x + bw < w - 50 and y + bh < h - 50 and
-                fill_ratio > 0.85):
+            # Datum boxes: small squares — thresholds scale with zoom
+            area_min    = scale_area(BOX_AREA_MIN,    self.zoom)
+            area_max    = scale_area(BOX_AREA_MAX,    self.zoom)
+            edge_margin = scale_length(BOX_EDGE_MARGIN, self.zoom)
+            if (area_min < area < area_max and
+                BOX_ASPECT_MIN < aspect < BOX_ASPECT_MAX and
+                x > edge_margin and y > edge_margin and
+                x + bw < w - edge_margin and y + bh < h - edge_margin and
+                fill_ratio > BOX_FILL_RATIO):
                 all_rects.append((x, y, bw, bh))
         
         # 4. Filter for ISOLATED boxes (not part of GD&T frame arrays)
@@ -76,8 +126,8 @@ class BoxCharacterDetector:
         for (x, y, bw, bh) in isolated:
             text, conf = self._ocr_box(image, x, y, bw, bh)
             
-            # Filter: must have valid text and reasonable confidence
-            if text and conf > 0.1 and len(text) <= 4:
+            # Only keep if it looks like a datum/reference marker
+            if text and conf > BOX_OCR_CONF_MIN and len(text) <= BOX_MAX_CHARS:
                 # Only keep if it looks like a datum/reference marker
                 # (single letter, letter+digit, or short number)
                 clean = text.strip()
@@ -92,7 +142,7 @@ class BoxCharacterDetector:
         
         return new_items
 
-    def detect_gdt_frames(self, image, existing_items=[], exclusion_items=[]):
+    def detect_gdt_frames(self, image, image_gray, existing_items=None, exclusion_items=None):
         """
         Detects bordered dimension/datum boxes that EasyOCR misses because they
         are surrounded by a rectangle.
@@ -102,9 +152,11 @@ class BoxCharacterDetector:
         looks like a decimal dimension (e.g. 4.88, 0.5) or a short datum reference
         (e.g. F, A B C, 0.5 A B).
         """
+        existing_items  = existing_items  or []
+        exclusion_items = exclusion_items or []
         import re
         h, w = image.shape[:2]
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        gray = image_gray
         _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
         contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -122,12 +174,15 @@ class BoxCharacterDetector:
             aspect = bw / float(bh) if bh > 0 else 0
             contour_area = cv2.contourArea(cnt)
             fill_ratio = contour_area / area if area > 0 else 0
-            # Allow wider boxes (dimension frames are wide): up to 20000 px area
-            # and aspect ratios up to 10 (wide dimension boxes)
-            if (700 < area < 20000 and
-                0.4 < aspect < 10.0 and
-                x > 50 and y > 50 and x + bw < w - 50 and y + bh < h - 50 and
-                fill_ratio > 0.75):
+            # Allow wider boxes (dimension frames are wide): thresholds scale with zoom
+            gdt_area_min    = scale_area(GDT_AREA_MIN,    self.zoom)
+            gdt_area_max    = scale_area(GDT_AREA_MAX,    self.zoom)
+            gdt_edge_margin = scale_length(GDT_EDGE_MARGIN, self.zoom)
+            if (gdt_area_min < area < gdt_area_max and
+                GDT_ASPECT_MIN < aspect < GDT_ASPECT_MAX and
+                x > gdt_edge_margin and y > gdt_edge_margin and
+                x + bw < w - gdt_edge_margin and y + bh < h - gdt_edge_margin and
+                fill_ratio > GDT_FILL_RATIO):
                 candidate_rects.append((x, y, bw, bh))
 
         if not candidate_rects:
@@ -135,12 +190,18 @@ class BoxCharacterDetector:
 
         # Skip rects already covered by existing items (centre inside existing bbox)
         # Skip rects already covered by existing items (check for significant area overlap)
+        combined_items = existing_items + exclusion_items
+        spatial_index = _build_spatial_index(combined_items, cell_size=100)
+
         def overlaps_existing(rx, ry, rw, rh):
             box_area = rw * rh
             if box_area == 0:
                 return False
                 
-            for it in existing_items + exclusion_items:
+            rcx, rcy = rx + rw / 2, ry + rh / 2
+            nearby_items = _get_nearby(spatial_index, rcx, rcy, cell_size=100)
+            
+            for it in nearby_items:
                 ix_min = min(p[0] for p in it['bbox'])
                 iy_min = min(p[1] for p in it['bbox'])
                 ix_max = max(p[0] for p in it['bbox'])
@@ -158,9 +219,9 @@ class BoxCharacterDetector:
                     return True
                     
                 # Also check if centers are very close
-                rcx, rcy = rx + rw / 2, ry + rh / 2
                 icx, icy = (ix_min + ix_max) / 2, (iy_min + iy_max) / 2
-                if abs(rcx - icx) < 40 and abs(rcy - icy) < 40:
+                prox = scale_length(DEDUP_CENTER_PROXIMITY, self.zoom)
+                if abs(rcx - icx) < prox and abs(rcy - icy) < prox:
                     return True
                     
             return False
@@ -198,14 +259,12 @@ class BoxCharacterDetector:
 
             # OCR the individual box
             text, conf = self._ocr_box(image, rx, ry, rw, rh)
-            if not text or conf < 0.15:
+            if not text or conf < GDT_OCR_CONF_MIN:
                 continue
 
             clean = text.strip()
-            # Accept only if it contains a decimal dimension OR looks like a datum ref
             if decimal_dim.search(clean) or datum_ref.match(clean):
-                # Extra sanity: reject very long strings (likely notes sneaking through)
-                if len(clean) > 25:
+                if len(clean) > GDT_MAX_TEXT_LEN:
                     continue
                 bbox = [[rx, ry], [rx + rw, ry], [rx + rw, ry + rh], [rx, ry + rh]]
                 new_items.append({'bbox': bbox, 'text': clean, 'confidence': conf, 'source': 'gdt_frame_detector'})
@@ -214,33 +273,33 @@ class BoxCharacterDetector:
 
         return new_items
 
-    def _is_isolated(self, rect, all_rects, margin=5):
-        """Check if a rectangle has no touching neighbors on the same row."""
+    def _is_isolated(self, rect, all_rects, margin=15):
+        """Check if a rectangle has no touching neighbors (including diagonals)."""
         x, y, bw, bh = rect
-        neighbors = 0
+        cx, cy = x + bw / 2, y + bh / 2
         for ox, oy, obw, obh in all_rects:
             if (ox, oy, obw, obh) == rect:
                 continue
-            # Check vertical alignment
-            y_overlap = max(0, min(y + bh, oy + obh) - max(y, oy))
-            if y_overlap < bh * 0.5:
-                continue
-            # Check horizontal touching
-            h_gap = min(abs(x + bw - ox), abs(ox + obw - x))
-            if h_gap < margin:
-                neighbors += 1
-        return neighbors == 0
+            ocx, ocy = ox + obw / 2, oy + obh / 2
+            dist = ((cx - ocx)**2 + (cy - ocy)**2) ** 0.5
+            # Two boxes are neighbours if their centres are within 2x the average box size
+            avg_size = ((bw + bh + obw + obh) / 4)
+            if dist < avg_size * 2 + margin:
+                return False
+        return True
     
     def _remove_in_exclusion_zones(self, rects, exclusion_items, image_shape):
         """Remove boxes that fall inside exclusion zones."""
         h, w = image_shape[:2]
         valid = []
+        spatial_index = _build_spatial_index(exclusion_items, cell_size=200)
         
         for (x, y, bw, bh) in rects:
             cx, cy = x + bw // 2, y + bh // 2
             in_exclusion = False
             
-            for item in exclusion_items:
+            nearby_excl = _get_nearby(spatial_index, cx, cy, cell_size=200)
+            for item in nearby_excl:
                 bbox = item['bbox']
                 ix_min = min(p[0] for p in bbox) - 10
                 iy_min = min(p[1] for p in bbox) - 10
@@ -256,16 +315,22 @@ class BoxCharacterDetector:
         
         return valid
     
-    def _remove_duplicates(self, rects, existing_items, overlap_threshold=0.5, proximity=40):
+    def _remove_duplicates(self, rects, existing_items,
+                            overlap_threshold=DEDUP_OVERLAP_THRESHOLD,
+                            proximity=None):
         """Remove boxes that significantly overlap with or are very close to already-detected text items."""
+        if proximity is None:
+            proximity = scale_length(DEDUP_CENTER_PROXIMITY, self.zoom)
         valid = []
+        spatial_index = _build_spatial_index(existing_items, cell_size=100)
         
         for (x, y, bw, bh) in rects:
             is_duplicate = False
             box_cx = x + bw / 2
             box_cy = y + bh / 2
             
-            for item in existing_items:
+            nearby_items = _get_nearby(spatial_index, box_cx, box_cy, cell_size=100)
+            for item in nearby_items:
                 bbox = item['bbox']
                 ix_min = min(p[0] for p in bbox)
                 iy_min = min(p[1] for p in bbox)
@@ -303,13 +368,16 @@ class BoxCharacterDetector:
         crop = image[max(0, y - pad):y + bh + pad, max(0, x - pad):x + bw + pad]
         
         # Upscale for better OCR accuracy
-        crop_big = cv2.resize(crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        upscale = BOX_OCR_UPSCALE
+        crop_big = cv2.resize(crop, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
         
-        results = self.reader.ocr(crop_big)
-        
-        if results and results[0]:
+        try:
+            results = self.reader.ocr(crop_big)
+            if not results or not results[0]:
+                return '', 0.0
             text = ' '.join([r[1][0] for r in results[0]]).strip()
             conf = max([r[1][1] for r in results[0]])
             return text, conf
-        
-        return '', 0.0
+        except (TypeError, IndexError, AttributeError) as e:
+            print(f"  [_ocr_box] OCR format error at ({x},{y}): {e}")
+            return '', 0.0

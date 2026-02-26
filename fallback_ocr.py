@@ -19,13 +19,23 @@ def detect_dimension_lines(gray, min_line_len=80, max_gap=10):
     Find near-horizontal and near-vertical lines in a grayscale crop.
     Returns list of (x1, y1, x2, y2) in crop-local coordinates.
     """
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180,
-        threshold=120,
-        minLineLength=min_line_len,
-        maxLineGap=max_gap
-    )
+    # Auto-threshold: works for both high-contrast vector and low-contrast scans
+    otsu_thresh, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    low  = max(0,   int(otsu_thresh * 0.5))
+    high = min(255, int(otsu_thresh * 1.5))
+    edges = cv2.Canny(gray, low, high)
+
+    # Try progressively lower Hough thresholds if no lines found
+    for hough_thresh in (120, 80, 50):
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180,
+            threshold=hough_thresh,
+            minLineLength=min_line_len,
+            maxLineGap=max_gap
+        )
+        if lines is not None:
+            break
+
     result = []
     if lines is not None:
         for x1, y1, x2, y2 in lines[:, 0]:
@@ -131,10 +141,24 @@ def run_fallback_ocr_on_zones(image, zones, easy_reader, extractor):
         # Upscale 2× to give EasyOCR more pixels
         crop_up = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)
 
-        try:
-            results = easy_reader.readtext(crop_up, detail=1)
-        except Exception as e:
-            print(f"  [fallback_ocr] EasyOCR error on zone ({px0},{py0}): {e}")
+        import concurrent.futures
+
+        def _easyocr_with_timeout(reader, crop, timeout_sec=15):
+            """Run EasyOCR with a timeout. Returns [] if it times out."""
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(reader.readtext, crop, detail=1)
+                try:
+                    return future.result(timeout=timeout_sec)
+                except concurrent.futures.TimeoutError:
+                    print(f"  [fallback_ocr] EasyOCR timed out after {timeout_sec}s — skipping zone")
+                    return []
+                except Exception as e:
+                    print(f"  [fallback_ocr] EasyOCR error: {e}")
+                    return []
+
+        results = _easyocr_with_timeout(easy_reader, crop_up, timeout_sec=15)
+        
+        if not results:
             continue
 
         for (bbox_e, text_raw, conf) in results:
