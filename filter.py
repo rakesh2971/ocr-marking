@@ -103,7 +103,7 @@ class AnnotationFilter:
                 if cr > dr:            # keep larger radius
                     deduped[best] = (cx, cy, cr)
 
-        print(f"  [circles] {len(circles_found)} raw → {len(deduped)} after dedup")
+        print(f"  [circles] {len(circles_found)} raw -> {len(deduped)} after dedup")
         return deduped
 
 
@@ -135,16 +135,66 @@ class AnnotationFilter:
         return False
 
     def filter_by_circles(self, text_items, circles):
-        """Filters out text items inside detected datum circles."""
+        """Filters out text items inside detected datum circles, or vertically beneath them (datum stacks)."""
+        import re
+        
+        def looks_engineering_annotation(text):
+            return bool(re.search(
+                r'''
+                \d+\.\d+|          # decimal dimension
+                [Ø⌀]|              # diameter
+                \b[A-Z]{1,3}\b|    # datum refs
+                NOS|               # quantity
+                ±|                 # tolerance
+                \(\s*\d            # bracket tolerance
+                ''',
+                text,
+                re.VERBOSE
+            ))
+
+        def is_datum_annotation(item, circles):
+            """
+            Detect datum bubble text attached to circle
+            (letter + value stacked under circle).
+            """
+            bbox = item['bbox']
+            cx = sum(p[0] for p in bbox) / 4
+            cy = sum(p[1] for p in bbox) / 4
+            text = item['text'].strip()
+
+            # Datum texts are short numeric or single letter
+            if not re.match(r'^-?\d+$|^[A-Z]$', text):
+                return False
+
+            for (dcx, dcy, r) in circles:
+                dx = abs(cx - dcx)
+                dy = cy - dcy
+                # same vertical column under circle
+                if dx < r * 0.7 and 0 < dy < r * 3.5:
+                    return True
+            return False
+
         valid_items = []
         excluded_items = []
         if circles is None or len(circles) == 0:
             return text_items, []
+            
         for item in text_items:
+            # 1. Geometrically inside the circle
             if self.is_inside_circle(item['bbox'], circles):
+                if looks_engineering_annotation(item['text']):
+                    valid_items.append(item)   # PROTECT
+                else:
+                    excluded_items.append(item)
+                continue
+                
+            # 2. Stacked beneath the circle (datum bubbles)
+            if is_datum_annotation(item, circles):
                 excluded_items.append(item)
-            else:
-                valid_items.append(item)
+                continue
+                
+            valid_items.append(item)
+                
         return valid_items, excluded_items
 
     def filter_notes_section(self, text_items):
@@ -207,7 +257,7 @@ class AnnotationFilter:
                 valid_items.append(item)
 
         print(f"  [notes filter] header at x={header_x_min:.0f}, y={header_y_min:.0f}  "
-              f"→ excluded {len(excluded_items)} items in notes zone")
+              f"-> excluded {len(excluded_items)} items in notes zone")
         return valid_items, excluded_items
 
 
@@ -410,6 +460,15 @@ class AnnotationFilter:
             text = item['text'].strip()
             text_up = text.upper()
 
+            gdt_like = re.search(
+                r'\d+(\.\d+)?\s+[A-Z](\s+[A-Z])+',
+                text_up
+            )
+
+            if gdt_like:
+                valid_items.append(item)
+                continue
+
             # ── Hard-exclude by regex (regardless of dimension content) ──────
             if (section_cut.match(text_up)
                     or view_letter.match(text_up)
@@ -573,4 +632,79 @@ class AnnotationFilter:
         self.title_block_cutoff_x = cutoff_x
         self.title_block_cutoff_y = cutoff_y
         return cutoff_x, cutoff_y
+
+    def filter_grid_coordinates(self, text_items):
+        """
+        Removes automotive grid coordinate markers:
+
+            X
+           800
+
+            Y
+          -400
+
+        These are NOT engineering annotations.
+        """
+
+        filtered = []
+        removed = []
+
+        used = set()
+
+        for i, item_a in enumerate(text_items):
+
+            if i in used:
+                continue
+
+            text_a = item_a["text"].strip().upper()
+
+            # must be axis label (e.g. X, Y, Z, XY, M)
+            if not re.match(r'^[A-Z]{1,2}$', text_a):
+                filtered.append(item_a)
+                continue
+
+            ax = sum(p[0] for p in item_a["bbox"]) / 4
+            ay = sum(p[1] for p in item_a["bbox"]) / 4
+
+            found_pair = False
+
+            for j, item_b in enumerate(text_items):
+
+                if i == j or j in used:
+                    continue
+
+                text_b = item_b["text"].strip()
+
+                # integer coordinate only, now allowing 1 digit (e.g. 0)
+                if not re.match(r'^-?\d{1,4}$', text_b):
+                    continue
+                    
+                # Protection: explicit GD&T tokens shouldn't be touched by the integer grid match
+                if item_b.get("type") == "GDT":
+                    continue
+
+                bx = sum(p[0] for p in item_b["bbox"]) / 4
+                by = sum(p[1] for p in item_b["bbox"]) / 4
+
+                x_align = abs(ax - bx) < 25
+                vertical_stack = 0 < abs(by - ay) < 120
+
+                if x_align and vertical_stack:
+                    removed.extend([item_a, item_b])
+                    used.add(i)
+                    used.add(j)
+                    found_pair = True
+                    break
+
+            if not found_pair:
+                filtered.append(item_a)
+
+        # keep remaining unused items
+        for k, item in enumerate(text_items):
+            if k not in used and item not in filtered:
+                filtered.append(item)
+
+        print(f"  Grid filter removed {len(removed)} items")
+
+        return filtered, removed
 

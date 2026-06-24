@@ -24,9 +24,20 @@ class Visualizer:
         idx = start_id
         self._placed_balloons = []   # reset every call so page 2+ don't avoid page 1 positions
 
+        DRAW_TYPES = {
+            "DIMENSION",
+            "GDT",
+            "NOTE",
+            "FEATURE_LABEL"
+        }
+
         for item in text_items:
             # Skip datum bubbles — they are reference markers, not annotations
             if item.get('type') == 'DATUM_BUBBLE':
+                continue
+
+            # Enforce safety net — only known annotations get ballooned.
+            if item.get('type') not in DRAW_TYPES:
                 continue
 
             bbox = item['bbox']

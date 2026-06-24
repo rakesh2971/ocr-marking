@@ -1,6 +1,56 @@
 
+# ── Python environments ──────────────────────────────────────────────────────
+.venv/
 venv310/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+
+# ── Secrets / local config ───────────────────────────────────────────────────
+.env
+.env.*
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
+
+# ── Generated output PDFs & CSVs (pipeline artefacts, not source) ────────────
+test_raster_out_*.pdf
+test_raster_out_*.csv
+test_raster_v*.pdf
+test_raster_v*.csv
+test_vector_out_v*.pdf
+test_vector_out_v*.csv
+final_test_v*.pdf
+final_test_v*.csv
+new_test_v*.pdf
+new_test_v*.csv
+test_trace.pdf
+test_trace.csv
+LCA_1.pdf
+LCA_debug_boxes.pdf
+
+# ── Debug / scratch images and text dumps ────────────────────────────────────
+_debug_page.png
+blob_test.png
+debug_y_circle.png
+debug_clusters_k*.png
+clahe_result.txt
+debug_drops_out.txt
+ocr_raw_dump.txt
+
+# ── Large JSON caches (regenerated on each run) ───────────────────────────────
+full_ocr.json
+raw_items.json
+
+# ── Bundled Python executable (29 MB binary, not source code) ────────────────
+python310.exe
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

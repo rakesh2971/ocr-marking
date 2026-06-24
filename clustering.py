@@ -19,10 +19,9 @@ class MorphologicalClusterer:
     def __init__(self):
         pass
 
-    def _get_view_regions(self, image_gray, items, exclusion_items, notes_zone=(None, None), title_block_zone=(None, None)):
+    def _get_view_regions(self, image_gray, items, exclusion_items, title_block_zone=(None, None)):
         """
         Detects major drawing parts/views by heavy morphological dilation.
-        notes_zone: (cutoff_x, cutoff_y) from filter_notes_section, or (None, None).
         title_block_zone: (cutoff_x, cutoff_y) from filter.detect_title_block_boundary.
         """
         gray = image_gray
@@ -38,30 +37,15 @@ class MorphologicalClusterer:
         draw_ink[cv2.morphologyEx(draw_ink, cv2.MORPH_OPEN, h_kern) > 0] = 0
         draw_ink[cv2.morphologyEx(draw_ink, cv2.MORPH_OPEN, v_kern) > 0] = 0
 
-        # Erase the notes / title block region using the dynamically detected boundary.
-        # Fall back to the 73% hardcoded heuristic when no header was detected.
-        notes_x, notes_y = notes_zone
-        tb_x, tb_y = title_block_zone
-        if notes_x is not None and notes_y is not None:
-            notes_x_px = int(notes_x)
-            notes_y_px = int(notes_y)
-            if tb_x is not None and tb_y is not None:
-                # Split the erase into two rectangles:
-                # 1. Notes column from its header down to title block top
-                # 2. Full width from title block top downward (already handled
-                #    by the title block erase below)
-                # This leaves the bottom-right section view area visible.
-                cv2.rectangle(draw_ink,
-                              (notes_x_px, notes_y_px),
-                              (w, int(tb_y)),
-                              0, -1)
-            else:
-                # No title block detected — erase full notes column to bottom
-                cv2.rectangle(draw_ink, (notes_x_px, notes_y_px), (w, h), 0, -1)
-        else:
-            # Fallback: rightmost 27% is assumed to be notes
-            cv2.rectangle(draw_ink, (int(w * 0.73), 0), (w, h), 0, -1)
-            
+        # Erase explicitly identified Notes text items
+        for item in exclusion_items:
+            if item.get("reason") == "notes":
+                bbox = item['bbox']
+                x0 = int(min(p[0] for p in bbox))
+                y0 = int(min(p[1] for p in bbox))
+                x1 = int(max(p[0] for p in bbox))
+                y1 = int(max(p[1] for p in bbox))
+                cv2.rectangle(draw_ink, (x0-20, y0-20), (x1+20, y1+20), 0, -1)    
         # Only erase title block if boundary was explicitly detected.
         # No hardcoded fallback — on wide drawings the bottom-right contains
         # valid section views that the old fixed cutoff was silently dropping.
@@ -77,11 +61,11 @@ class MorphologicalClusterer:
             x_max = int(max(p[0] for p in bbox))
             y_min = int(min(p[1] for p in bbox))
             y_max = int(max(p[1] for p in bbox))
-            pad = 5
+            pad = 2
             cv2.rectangle(draw_ink, (max(0, x_min-pad), max(0, y_min-pad)), (min(w, x_max+pad), min(h, y_max+pad)), 0, -1)
 
         # Heavy dilation to merge parts and their annotations into single blobs
-        k_size = 90
+        k_size = max(35, int(min(h, w) * 0.025))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
         dilated = cv2.dilate(draw_ink, kernel, iterations=1)
 
@@ -126,7 +110,7 @@ class MorphologicalClusterer:
         part_boxes.sort(key=lambda b: (b[1] // ROW_HEIGHT, b[0]))
         return part_boxes
 
-    def get_clusters(self, image_gray, items, exclusion_items=[], notes_zone=(None, None), title_block_zone=(None, None)):
+    def get_clusters(self, image_gray, items, exclusion_items=[], title_block_zone=(None, None)):
         """
         Groups annotations by drawing view regions (layout), not by proximity.
 
@@ -134,7 +118,7 @@ class MorphologicalClusterer:
         - Assigns each annotation to its containing view, or nearest view if none contains.
         - Sorts views in reading order (Top → Bottom, Left → Right).
         - Sorts annotations within each view in reading order.
-        - notes_zone: (cutoff_x, cutoff_y) from filter_notes_section.
+        - title_block_zone: (cutoff_x, cutoff_y) from filter.detect_title_block_boundary.
         - Returns (cluster_info, labeled_img) for sequential view-by-view numbering.
         """
         gray = image_gray
@@ -162,7 +146,7 @@ class MorphologicalClusterer:
 
         view_rects = self._get_view_regions(
             image_gray, items, exclusion_items,
-            notes_zone=notes_zone, title_block_zone=title_block_zone
+            title_block_zone=title_block_zone
         )
         if not view_rects:
             view_rects = [(0, 0, w, h)]
@@ -182,24 +166,6 @@ class MorphologicalClusterer:
                 if cx >= tb_x and cy >= tb_y:
                     continue
 
-            # Skip items in the notes zone if we have a dynamic boundary.
-            # Use a stricter x cutoff — only skip items clearly inside the
-            # notes column (within 50px right of the detected header x).
-            # This prevents cutting bottom-right section views that share
-            # a similar x position but are actually left of the notes column.
-            notes_x, notes_y = notes_zone
-            if notes_x is not None and notes_y is not None:
-                notes_right_edge = w  # notes run to the right edge
-                if cx >= notes_x and cy >= notes_y and cx <= notes_right_edge:
-                    # Extra guard: if title block boundary is known, only skip
-                    # if we're NOT in the valid drawing area below the notes
-                    tb_x, tb_y = title_block_zone
-                    if tb_x is None or cx >= tb_x:
-                        continue
-            else:
-                # Fallback: skip rightmost 27%
-                if cx > w * 0.73:
-                    continue
 
             best_view = None
             best_dist_sq = float('inf')
@@ -216,6 +182,14 @@ class MorphologicalClusterer:
 
             if best_view is not None:
                 view_to_items[best_view].append(item)
+
+        # Safety Fallback: Assign unmapped view items to their geometric closest match
+        if not any(item in v for v in view_to_items.values()):
+            nearest = min(
+                range(len(view_rects)),
+                key=lambda vi: _dist_point_to_rect(cx, cy, *view_rects[vi])
+            )
+            view_to_items[nearest].append(item)
 
         # ── Row binning: 600px nominal rows (or ~8 rows if image taller) ──
         # Each cluster is assigned to the row that contains its top edge (ry).

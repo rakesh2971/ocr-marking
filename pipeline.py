@@ -147,6 +147,10 @@ class AnnotationPipeline:
         items, excl_datums = self.annot_filter.filter_by_circles(raw_items, circles)
         print(f"  - Removed {len(excl_datums)} items inside datum circles.")
 
+        # A2. Grid Coordinates / Car Lines
+        items, excl_grid = self.annot_filter.filter_grid_coordinates(items)
+        print(f"  - Removed {len(excl_grid)} items forming grid coordinates.")
+
         # B. Notes section
         items, excl_notes = self.annot_filter.filter_notes_section(items)
         print(f"  - Removed {len(excl_notes)} items from Notes section.")
@@ -182,7 +186,7 @@ class AnnotationPipeline:
         items, excl_corner = self.annot_filter.filter_top_left_numbers(items, image.shape)
         print(f"  - Removed {len(excl_corner)} items from Top-Left Corner.")
 
-        excluded = excl_datums + excl_notes + excl_table + excl_views + excl_corner
+        excluded = excl_datums + excl_grid + excl_notes + excl_table + excl_views + excl_corner
 
         # F. Early text-pattern cleanup (part numbers / table header fragments)
         pre = len(items)
@@ -245,17 +249,14 @@ class AnnotationPipeline:
     def stage_cluster(self, image_gray, items, excluded):
         """Stage 5: Group items by drawing view, return (cluster_info, view_rects)."""
         print("Grouping annotations by drawing views...")
-        notes_zone = (
-            self.annot_filter.notes_cutoff_x,
-            self.annot_filter.notes_cutoff_y,
-        )
+        # Use dynamically detected title block boundary instead of hardcoded %
         title_block_zone = (
             getattr(self.annot_filter, 'title_block_cutoff_x', None),
             getattr(self.annot_filter, 'title_block_cutoff_y', None),
         )
         cluster_info, _, view_rects = self.clusterer.get_clusters(
             image_gray, items, exclusion_items=excluded,
-            notes_zone=notes_zone, title_block_zone=title_block_zone
+            title_block_zone=title_block_zone
         )
         print(f"Views detected: {len(cluster_info)}")
         return cluster_info, view_rects

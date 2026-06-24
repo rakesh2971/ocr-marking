@@ -298,7 +298,10 @@ class TextExtractor:
             re.compile(r'\d{2,}'),                           # 2+ digit number fragment
         ]
         if not any(p.search(t) for p in _GOOD):
-            print(f"  [repair_merged] noise drop: '{t}' (original: '{text}')")
+            try:
+                print(f"  [repair_merged] noise drop: '{t}' (original: '{text}')")
+            except UnicodeEncodeError:
+                print("  [repair_merged] noise drop: <unicode string>")
             return None
 
         return t
@@ -337,6 +340,14 @@ class TextExtractor:
         # 4c. MIXED GD&T FRAME — e.g. "3.4 X Y", "6.8 UZ Z", "5.4 XY Z"
         if re.match(r'^\d+(\.\d+)?\s+[A-Z]{1,3}(\s+[A-Z]{1,3})*$', t):
             return "GDT"
+
+        # 4d. Mixed GD&T frame (without symbols)
+        if re.match(r'^\d+(\.\d+)?(\s+[A-Z]){1,4}$', t):
+            return "GDT"
+
+        # 4e. Delta dimension rule
+        if "Δ" in t or "DELTA" in t.upper():
+            return "DIMENSION"
 
         # 5. NOTE — whole-word keyword match against functional engineering terms
         #    Uses word extraction to avoid substring false-positives

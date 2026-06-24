@@ -90,7 +90,7 @@ class VectorExtractor:
 
         return self._merge_vector_items(items)
 
-    def _merge_vector_items(self, items: list, x_gap: float = 180.0, y_thresh: float = 15.0) -> list:
+    def _merge_vector_items(self, items: list, x_gap: float = 70.0, y_thresh: float = 15.0) -> list:
         """
         Merges horizontally adjacent text items. PyMuPDF 'words' occasionally separates
         content living in distinct boxes (like GD&T cells [0.3] [S] [U]), even when
@@ -212,6 +212,12 @@ class VectorExtractor:
 
             # 4. Classify the token type (DIMENSION, GDT, TEXT, etc.)
             item['type'] = extractor.classify_token(repaired)
+            
+            # 5. Fix Vector Frame Fragment Loss: 
+            # Vector drawings are usually explicitly stated; boost their confidence 
+            # to protect against geometric morphology destruction logic down the line.
+            if item.get('source') == "vector":
+                item['confidence'] = 1.5
 
             result.append(item)
 
